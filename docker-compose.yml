@@ -1,0 +1,83 @@
+# ============================================================
+# Bulwark — Docker Compose (Local Development)
+# ============================================================
+# Start the full development stack with: docker-compose up
+# ============================================================
+
+services:
+  # ── MongoDB ──
+  mongodb:
+    image: mongo:7.0
+    container_name: bulwark-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: bulwark
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── WireMock (dependency mocking) ──
+  wiremock:
+    image: wiremock/wiremock:3.9.1
+    container_name: bulwark-wiremock
+    ports:
+      - "8082:8080"
+    command: --verbose --global-response-templating
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/__admin/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Webhook Receiver ──
+  webhook-receiver:
+    build:
+      context: .
+      dockerfile: webhook_receiver/Dockerfile
+    container_name: bulwark-webhook
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - BULWARK_MODE=development
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=bulwark
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health').raise_for_status()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Orchestrator (dev mode — polls MongoDB queue) ──
+  orchestrator:
+    build:
+      context: .
+      dockerfile: webhook_receiver/Dockerfile  # Reuses the same base image
+    container_name: bulwark-orchestrator
+    command: ["python", "-m", "orchestrator.agent"]
+    env_file:
+      - .env
+    environment:
+      - BULWARK_MODE=development
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=bulwark
+      - PYTHONPATH=/app
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      webhook-receiver:
+        condition: service_healthy
+
+volumes:
+  mongodb_data:
+    driver: local
