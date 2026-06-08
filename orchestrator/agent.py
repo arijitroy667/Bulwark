@@ -34,6 +34,9 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
+
+import httpx
 
 from shared.config import settings
 from shared.db import (
@@ -346,31 +349,26 @@ async def run_simulation(message: MREventMessage) -> None:
         try:
             from traffic_replay.replayer import replay_traffic
 
-            # If no production requests, fall back to synthetic health check probes
             if not production_requests:
-                logger.warning("No production requests — using synthetic health check probes")
-                from shared.models import ProductionRequest
-                production_requests = [
-                    ProductionRequest(method="GET", path="/health", expected_status=200),
-                    ProductionRequest(method="GET", path="/", expected_status=200),
-                ]
+                logger.warning("No production requests returned by Dynatrace — skipping replay")
+                replay_result = ReplayResult(simulation_id=simulation_id)
+            else:
+                replay_result = await replay_traffic(
+                    environment=environment,
+                    requests=production_requests,
+                    baseline=baseline,
+                    concurrency=settings.replay_concurrency,
+                )
 
-            replay_result = await replay_traffic(
-                environment=environment,
-                requests=production_requests,
-                baseline=baseline,
-                concurrency=settings.replay_concurrency,
-            )
-
-            logger.info(
-                "Replay: %d/%d ok | p95=%.1fms (Δ%+.1fms) | errors=%.2f%% | novel_errors=%d",
-                replay_result.successful_requests,
-                replay_result.total_requests,
-                replay_result.actual_p95_ms,
-                replay_result.latency_delta_p95_ms,
-                replay_result.actual_error_rate_percent,
-                len(replay_result.novel_error_messages),
-            )
+                logger.info(
+                    "Replay: %d/%d ok | p95=%.1fms (Δ%+.1fms) | errors=%.2f%% | novel_errors=%d",
+                    replay_result.successful_requests,
+                    replay_result.total_requests,
+                    replay_result.actual_p95_ms,
+                    replay_result.latency_delta_p95_ms,
+                    replay_result.actual_error_rate_percent,
+                    len(replay_result.novel_error_messages),
+                )
 
         except Exception as e:
             error_msg = f"Step 5 (REPLAY) failed: {e}"
@@ -390,9 +388,7 @@ async def run_simulation(message: MREventMessage) -> None:
             try:
                 from orchestrator.tools.arize_tool import log_spans, run_eval
 
-                # Collect LLM outputs from the replay results
-                # (In a real deployment, the ephemeral service exposes a /traces endpoint)
-                llm_outputs = _extract_llm_outputs_from_replay(replay_result)
+                llm_outputs = await _extract_llm_outputs_from_replay(environment)
 
                 arize_result = await run_eval(
                     simulation_id=simulation_id,
@@ -574,17 +570,66 @@ async def _get_simulation(simulation_id: str) -> dict | None:
         return None
 
 
-def _extract_llm_outputs_from_replay(replay_result: ReplayResult) -> list[dict]:
+async def _extract_llm_outputs_from_replay(environment: Any | None) -> list[dict[str, Any]]:
     """
-    Extract LLM-specific outputs from replay results for Arize evaluation.
+    Fetch LLM-specific outputs from the ephemeral service for Arize evaluation.
 
-    In a real deployment, the ephemeral service exposes a /traces endpoint
-    that captures LLM spans during traffic replay. In development mode,
-    this returns an empty list, triggering synthetic data in run_eval.
+    The service must expose a real /traces endpoint populated during traffic
+    replay. Supported response shapes are either a list of trace objects or an
+    object containing "traces" or "spans". Each returned trace must contain at
+    least "prompt" and "response"; "context" is optional.
     """
-    # TODO (Phase 3): Query ephemeral environment's /traces endpoint
-    # after replay to collect {prompt, response, context} dicts
-    return []
+    if environment is None or not getattr(environment, "base_url", ""):
+        logger.warning("LLM trace capture skipped: ephemeral environment URL is unavailable")
+        return []
+
+    traces_url = f"{environment.base_url.rstrip('/')}/traces"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            response = await client.get(traces_url, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "LLM trace capture skipped: /traces returned HTTP %s",
+            e.response.status_code,
+        )
+        return []
+    except Exception as e:
+        logger.warning("LLM trace capture skipped: failed to fetch /traces: %s", e)
+        return []
+
+    raw_traces: Any
+    if isinstance(payload, list):
+        raw_traces = payload
+    elif isinstance(payload, dict):
+        raw_traces = payload.get("traces") or payload.get("spans") or []
+    else:
+        logger.warning("LLM trace capture skipped: /traces returned unsupported JSON shape")
+        return []
+
+    if not isinstance(raw_traces, list):
+        logger.warning("LLM trace capture skipped: /traces trace collection is not a list")
+        return []
+
+    llm_outputs: list[dict[str, Any]] = []
+    for trace in raw_traces:
+        if not isinstance(trace, dict):
+            continue
+
+        prompt = trace.get("prompt")
+        response_text = trace.get("response")
+        if not isinstance(prompt, str) or not isinstance(response_text, str):
+            continue
+
+        normalized = dict(trace)
+        normalized["prompt"] = prompt
+        normalized["response"] = response_text
+        normalized.setdefault("context", trace.get("context"))
+        llm_outputs.append(normalized)
+
+    logger.info("Captured %d LLM trace(s) from %s", len(llm_outputs), traces_url)
+    return llm_outputs
 
 
 # ──────────────────────────────────────────────

@@ -11,10 +11,9 @@ MCP Operations implemented:
   - log_spans()            → logSpans
 
 If the Arize API is unavailable, all functions fail gracefully and return
-a result with skip_reason set (per PRD §16 error handling).
-
-Note: In development mode (BULWARK_MODE=development), synthetic baseline
-data is returned to allow end-to-end pipeline testing without real Arize.
+a result with skip_reason set (per PRD §16 error handling). These functions
+do not fabricate development-mode Arize scores; all evaluations require real
+captured spans and real Arize API responses.
 """
 
 from __future__ import annotations
@@ -56,10 +55,6 @@ async def get_llm_baseline(service_name: str) -> dict[str, Any]:
     Returns dict with keys: dataset_id, hallucination_score, relevance_score,
     groundedness_score, span_count.
     """
-    if settings.bulwark_mode == "development":
-        logger.info("Development mode: returning synthetic Arize baseline for %s", service_name)
-        return _synthetic_baseline(service_name)
-
     logger.info("Fetching Arize LLM baseline for service: %s", service_name)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -128,10 +123,6 @@ async def run_eval(
         ArizeEvalResult with score deltas and metadata.
     """
     start_time = time.time()
-
-    if settings.bulwark_mode == "development":
-        logger.info("Development mode: returning synthetic Arize eval result")
-        return _synthetic_eval_result(simulation_id)
 
     if not simulation_outputs:
         return ArizeEvalResult(
@@ -253,10 +244,6 @@ async def log_spans(simulation_id: str, traces: list[dict[str, Any]]) -> bool:
     if not traces:
         return True
 
-    if settings.bulwark_mode == "development":
-        logger.info("Development mode: Arize span logging skipped (would log %d spans)", len(traces))
-        return True
-
     logger.info("Logging %d spans to Arize for simulation %s", len(traces), simulation_id)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -275,40 +262,3 @@ async def log_spans(simulation_id: str, traces: list[dict[str, Any]]) -> bool:
     except Exception as e:
         logger.warning("Arize span logging failed (non-critical): %s", e)
         return False
-
-
-# ──────────────────────────────────────────────
-# Development mode synthetic data
-# ──────────────────────────────────────────────
-
-
-def _synthetic_baseline(service_name: str) -> dict[str, Any]:
-    """Return synthetic production baseline for development/testing."""
-    return {
-        "dataset_id": f"dev-baseline-{service_name}",
-        "hallucination_score": 0.15,
-        "relevance_score": 0.82,
-        "groundedness_score": 0.78,
-        "span_count": 450,
-        "synthetic": True,
-    }
-
-
-def _synthetic_eval_result(simulation_id: str) -> ArizeEvalResult:
-    """Return synthetic evaluation result for development/testing."""
-    return ArizeEvalResult(
-        llm_detected=True,
-        hallucination_delta=0.05,   # Within noise band — not scored
-        relevance_delta=-0.03,      # Within noise band — not scored
-        groundedness_delta=0.02,    # Within noise band — not scored
-        sim_hallucination_score=0.20,
-        sim_relevance_score=0.79,
-        sim_groundedness_score=0.80,
-        baseline_hallucination_score=0.15,
-        baseline_relevance_score=0.82,
-        baseline_groundedness_score=0.78,
-        eval_dataset_id=f"dev-sim-{simulation_id}",
-        baseline_dataset_id="dev-baseline",
-        arize_span_logged=True,
-        eval_duration_ms=850,
-    )
