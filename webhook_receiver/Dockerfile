@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy shared modules
 COPY shared/ ./shared/
 
+# Copy GitLab helper package used for override handling
+COPY orchestrator/ ./orchestrator/
+
 # Copy webhook receiver
 COPY webhook_receiver/ ./
 

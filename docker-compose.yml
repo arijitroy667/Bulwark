@@ -62,7 +62,7 @@ services:
   orchestrator:
     build:
       context: .
-      dockerfile: webhook_receiver/Dockerfile  # Reuses the same base image
+      dockerfile: orchestrator/Dockerfile
     container_name: bulwark-orchestrator
     command: ["python", "-m", "orchestrator.agent"]
     env_file:

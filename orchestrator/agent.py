@@ -64,6 +64,43 @@ logger = logging.getLogger("bulwark.orchestrator")
 
 async def run_simulation(message: MREventMessage) -> None:
     """
+    Run a simulation with the configured hard timeout.
+
+    The inner workflow also handles ordinary step failures. This wrapper covers
+    the PRD hard ceiling: if the whole workflow exceeds the allowed runtime,
+    cancel it, mark the simulation timed out, and force teardown.
+    """
+    start_time = time.time()
+    try:
+        await asyncio.wait_for(
+            _run_simulation_impl(message),
+            timeout=settings.simulation_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        error_log = [
+            f"Simulation timed out after {settings.simulation_timeout_seconds} seconds"
+        ]
+        logger.error(
+            "Simulation %s timed out after %ds",
+            message.simulation_id,
+            settings.simulation_timeout_seconds,
+        )
+        await _fail_simulation(
+            message.simulation_id,
+            error_log,
+            start_time,
+            status=SimulationStatus.TIMED_OUT,
+        )
+        try:
+            from environment_builder.builder import teardown_environment
+
+            await teardown_environment(message.simulation_id)
+        except Exception as e:
+            logger.error("Timed-out simulation teardown failed: %s", e)
+
+
+async def _run_simulation_impl(message: MREventMessage) -> None:
+    """
     Execute the full Bulwark simulation workflow for a merge request.
 
     This is the entry point called when a Pub/Sub message is consumed.
@@ -244,6 +281,9 @@ async def run_simulation(message: MREventMessage) -> None:
         # Run both in parallel
         await asyncio.gather(_fetch_dynatrace_baseline(), _fetch_arize_baseline())
 
+        if await _should_abort_cancelled(simulation_id):
+            return
+
         # Check for active incident (defer evaluation if found)
         if has_incident:
             logger.warning("Active incident detected for %s — deferring", service_name)
@@ -328,6 +368,9 @@ async def run_simulation(message: MREventMessage) -> None:
             })
             logger.info("Environment healthy: %s", environment.base_url)
 
+            if await _should_abort_cancelled(simulation_id, teardown=True):
+                return
+
         except Exception as e:
             error_msg = f"Step 4 (PROVISION) failed: {e}"
             logger.error(error_msg)
@@ -375,6 +418,9 @@ async def run_simulation(message: MREventMessage) -> None:
             logger.error(error_msg)
             error_log.append(error_msg)
             replay_result = ReplayResult(simulation_id=simulation_id)
+
+        if await _should_abort_cancelled(simulation_id, teardown=True):
+            return
 
         # ════════════════════════════════════════════
         # STEP 6: LLM EVALUATION [Arize MCP]
@@ -424,6 +470,9 @@ async def run_simulation(message: MREventMessage) -> None:
             )
             logger.info("Step 6: LLM evaluation skipped — no LLM components detected")
 
+        if await _should_abort_cancelled(simulation_id, teardown=True):
+            return
+
         # ════════════════════════════════════════════
         # STEP 7: TEARDOWN
         # ════════════════════════════════════════════
@@ -436,6 +485,9 @@ async def run_simulation(message: MREventMessage) -> None:
             logger.error(error_msg)
             error_log.append(error_msg)
             # Teardown failure is logged but does not stop the verdict
+
+        if await _should_abort_cancelled(simulation_id):
+            return
 
         # ════════════════════════════════════════════
         # STEP 8: GEMINI REASONING
@@ -568,6 +620,23 @@ async def _get_simulation(simulation_id: str) -> dict | None:
         return await db["simulations"].find_one({"_id": simulation_id})
     except Exception:
         return None
+
+
+async def _should_abort_cancelled(simulation_id: str, teardown: bool = False) -> bool:
+    """Return True if this simulation was cancelled by a newer MR commit."""
+    sim_doc = await _get_simulation(simulation_id)
+    if not sim_doc or sim_doc.get("status") != SimulationStatus.CANCELLED.value:
+        return False
+
+    logger.info("Simulation %s was cancelled — aborting stale workflow", simulation_id)
+    if teardown:
+        try:
+            from environment_builder.builder import teardown_environment
+
+            await teardown_environment(simulation_id)
+        except Exception as e:
+            logger.error("Cancelled simulation teardown failed: %s", e)
+    return True
 
 
 async def _extract_llm_outputs_from_replay(environment: Any | None) -> list[dict[str, Any]]:

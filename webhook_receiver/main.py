@@ -81,6 +81,91 @@ def _generate_simulation_id(mr_id: int, source_branch: str, sha: str) -> str:
     return f"sim_{short_hash}"
 
 
+def _extract_label_names(labels: Any) -> set[str]:
+    """Extract label names from GitLab's string or object label shapes."""
+    names: set[str] = set()
+    if not isinstance(labels, list):
+        return names
+    for label in labels:
+        if isinstance(label, str):
+            names.add(label)
+        elif isinstance(label, dict):
+            name = label.get("title") or label.get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _has_override_label(body: dict[str, Any], object_attrs: dict[str, Any]) -> bool:
+    """Return True when the MR update includes the bulwark-override label."""
+    labels = set()
+    labels.update(_extract_label_names(object_attrs.get("labels")))
+    labels.update(_extract_label_names(body.get("labels")))
+
+    changes = body.get("changes", {})
+    if isinstance(changes, dict):
+        label_change = changes.get("labels")
+        if isinstance(label_change, dict):
+            labels.update(_extract_label_names(label_change.get("current")))
+            labels.update(_extract_label_names(label_change.get("previous")))
+
+    return "bulwark-override" in labels
+
+
+async def _handle_override_label(
+    project_id: str,
+    mr_id: int,
+    head_sha: str,
+    override_author: str,
+) -> WebhookResponse:
+    """Apply a human override to the latest BLOCKED simulation for this MR."""
+    from orchestrator.tools.gitlab_tool import post_mr_comment, set_pipeline_status
+    from shared.db import log_override_event
+
+    db = await get_database()
+    simulation = await db["simulations"].find_one(
+        {
+            "mr_id": mr_id,
+            "verdict.verdict": "BLOCKED",
+            "gitlab.override_applied": {"$ne": True},
+        },
+        sort=[("created_at", -1)],
+    )
+
+    if not simulation:
+        logger.info("Override label ignored: no blocked simulation found for MR !%d", mr_id)
+        return WebhookResponse(
+            status="skipped",
+            message="No blocked Bulwark simulation found to override",
+        )
+
+    simulation_id = simulation["_id"]
+    await log_override_event(simulation_id, mr_id, override_author)
+
+    await set_pipeline_status(
+        project_id=project_id,
+        sha=head_sha,
+        state="success",
+        description=f"OVERRIDDEN — human override applied by {override_author}",
+    )
+    await post_mr_comment(
+        project_id,
+        mr_id,
+        (
+            "## Bulwark Override Applied\n\n"
+            f"`bulwark-override` was applied by `{override_author}`. "
+            "The blocked verdict has been overridden and logged for audit.\n\n"
+            f"*Simulation ID: `{simulation_id}`*"
+        ),
+    )
+
+    return WebhookResponse(
+        status="overridden",
+        simulation_id=simulation_id,
+        message="Blocked verdict overridden",
+    )
+
+
 # ──────────────────────────────────────────────
 # Pub/Sub publisher (abstracted for testability)
 # ──────────────────────────────────────────────
@@ -232,6 +317,18 @@ async def receive_gitlab_webhook(
 
     project = body.get("project", {})
     project_id = project.get("path_with_namespace", "")
+
+    user = body.get("user", {})
+    override_author = user.get("username") or user.get("name") or "unknown"
+
+    # ── Override handling: label updates should not enqueue a fresh simulation ──
+    if action == "update" and _has_override_label(body, object_attrs):
+        return await _handle_override_label(
+            project_id=project_id,
+            mr_id=mr_id,
+            head_sha=head_sha,
+            override_author=override_author,
+        )
 
     # ── Step 6: Filter — skip documentation-only MRs ──
     changes = body.get("changes", {})

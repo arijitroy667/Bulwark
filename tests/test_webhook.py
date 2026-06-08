@@ -34,6 +34,7 @@ settings.bulwark_mode = "development"
 settings.mongodb_uri = "mongodb://localhost:27017"
 
 from webhook_receiver.main import (
+    _has_override_label,
     _generate_simulation_id,
     _is_doc_only_mr,
     app,
@@ -133,6 +134,19 @@ def test_invalid_token_rejected():
         json=SAMPLE_MR_WEBHOOK,
     )
     assert response.status_code == 400
+
+
+def test_override_label_detected_from_gitlab_label_change():
+    """bulwark-override labels should be detected from GitLab update payloads."""
+    body = {
+        "changes": {
+            "labels": {
+                "current": [{"title": "bulwark-override"}],
+                "previous": [],
+            }
+        }
+    }
+    assert _has_override_label(body, {}) is True
 
 
 # ──────────────────────────────────────────────

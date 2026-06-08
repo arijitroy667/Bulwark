@@ -20,6 +20,18 @@ variable "environment" {
   default     = "development"
 }
 
+variable "mongodb_db_name" {
+  description = "MongoDB database name"
+  type        = string
+  default     = "bulwark"
+}
+
+variable "gemini_model" {
+  description = "Gemini model ID"
+  type        = string
+  default     = "gemini-2.0-flash"
+}
+
 # ── Secret values (passed via terraform.tfvars or environment) ──
 
 variable "gitlab_webhook_token" {

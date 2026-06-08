@@ -12,6 +12,16 @@ output "webhook_endpoint" {
   value       = "${google_cloud_run_v2_service.webhook_receiver.uri}/webhook/gitlab"
 }
 
+output "orchestrator_worker_url" {
+  description = "URL of the Bulwark orchestrator worker"
+  value       = google_cloud_run_v2_service.orchestrator_worker.uri
+}
+
+output "orchestrator_pubsub_endpoint" {
+  description = "Pub/Sub push endpoint for the orchestrator worker"
+  value       = "${google_cloud_run_v2_service.orchestrator_worker.uri}/pubsub/orchestrate"
+}
+
 output "pubsub_topic" {
   description = "Pub/Sub topic for MR events"
   value       = google_pubsub_topic.mr_events.name
