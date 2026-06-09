@@ -66,6 +66,25 @@ class BulwarkSettings(BaseSettings):
     confidence_threshold_approved: int = 80  # ≥80 → APPROVED
     confidence_threshold_warning: int = 50   # 50–79 → WARNING; <50 → BLOCKED
 
+    # ─────────────────────────────────────────────────────────
+    # Phase 2: MCP Integration (PLAN.md §Phase 2)
+    # ─────────────────────────────────────────────────────────
+    # URLs of the remote MCP servers (Cloud Run-hosted).
+    # Format: https://<service>-<hash>-<region>.a.run.app/sse  (SSE transport)
+    gitlab_mcp_url: str = ""       # e.g. https://gitlab-mcp-xxx.run.app/sse
+    dynatrace_mcp_url: str = ""    # e.g. https://dynatrace-mcp-xxx.run.app/sse
+    arize_mcp_url: str = ""        # e.g. https://arize-mcp-xxx.run.app/sse
+
+    # Shared bearer token sent as Authorization header for all MCP requests.
+    # Leave empty if the MCP servers do not require authentication.
+    mcp_auth_token: str = ""
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 3: Real Environment Build (PLAN.md §Phase 3)
+    # ─────────────────────────────────────────────────────────
+    # GCS bucket used as Cloud Build StorageSource for GitLab archive uploads.
+    gcp_source_archive_bucket: str = "bulwark-build-sources"
+
     @property
     def dynatrace_base_url(self) -> str:
         """Construct the Dynatrace API base URL from the environment ID."""

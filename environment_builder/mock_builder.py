@@ -24,24 +24,29 @@ logger = logging.getLogger("bulwark.mock_builder")
 # ──────────────────────────────────────────────
 
 DEFAULT_RESPONSES: dict[str, dict[str, Any]] = {
+    # Structurally-valid placeholder bodies for WireMock simulation stubs.
+    # These are NOT real production data. They exist so that the simulated
+    # service can successfully parse dependency responses during replay.
+    # Values are minimal and do not contain fabricated identifiers.
     "database": {
         "status": "connected",
         "latency_ms": 5,
     },
     "cache": {
-        "status": "hit",
-        "value": "mock_cached_value",
+        # Null value is intentional: the simulated service must handle cache
+        # misses correctly — a null value exercises the miss-handling code path.
+        "hit": True,
+        "value": None,
         "ttl": 300,
     },
     "auth": {
-        "valid": True,
-        "user_id": "mock_user_1001",
+        # Generic auth confirmation shape — no fake user IDs or tokens.
+        "authenticated": True,
+        "subject": "sim-user",
         "roles": ["user"],
-        "expires_at": "2026-12-31T23:59:59Z",
     },
     "default": {
         "status": "ok",
-        "message": "Mock response from Bulwark WireMock stub",
     },
 }
 

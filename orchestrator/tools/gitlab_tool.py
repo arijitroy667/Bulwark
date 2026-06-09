@@ -1,11 +1,17 @@
 """
-Bulwark — GitLab MCP Integration Tool (v3.0).
+Bulwark — GitLab MCP Integration Tool (Phase 2, PLAN.md §Phase 2).
 
-Wrapper functions over the GitLab REST API for all operations in PRD §6.1:
-  - getMergeRequest / getCommits / getRepositoryFiles
-  - createMergeRequestNote  (post verdict comment)
-  - createPipelineStatus    (set Bulwark/production-ready gate)
-  - updateMergeRequest      (approve or request changes)
+All operations go through the GitLab MCP server via ``shared.mcp_client``.
+Python function signatures are unchanged from Phase 1 so that ``agent.py``
+requires no modifications.
+
+MCP operations implemented (per PRD §6.1):
+  getMergeRequest       → get_mr_details()
+  getMergeRequestDiff   → get_mr_diff()
+  getRepositoryFiles    → get_file_content() / get_file_contents_batch()
+  createMergeRequestNote → post_mr_comment()
+  createPipelineStatus  → set_pipeline_status()
+  updateMergeRequest    → update_mr_approval()
 
 LLM component detection has been moved to orchestrator/llm_detector.py.
 The v1 string-matching approach (`system_prompt` etc.) is removed — it
@@ -19,9 +25,7 @@ import logging
 import re
 from pathlib import Path
 
-import httpx
-
-from shared.config import settings
+from shared.mcp_client import MCPCallError, MCPConfigError, MCPServer, call_tool
 from shared.models import FileDiff, MergeRequestDetails
 
 logger = logging.getLogger("bulwark.gitlab")
@@ -32,68 +36,51 @@ DOC_DIRECTORIES = {"docs/", "doc/", "documentation/"}
 
 
 # ──────────────────────────────────────────────
-# HTTP client
-# ──────────────────────────────────────────────
-
-
-def _get_headers() -> dict[str, str]:
-    """Build GitLab API request headers with authentication."""
-    return {
-        "PRIVATE-TOKEN": settings.gitlab_pat,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-def _api_url(path: str) -> str:
-    """Build a full GitLab API URL."""
-    return f"{settings.gitlab_api_url}{path}"
-
-
-def _encode_project_id(project_id: str) -> str:
-    """URL-encode a project path for the GitLab API (slashes → %2F)."""
-    return project_id.replace("/", "%2F")
-
-
-# ──────────────────────────────────────────────
 # MR Operations
 # ──────────────────────────────────────────────
 
 
 async def get_mr_details(project_id: str, mr_id: int) -> MergeRequestDetails:
     """
-    Fetch full merge request metadata from GitLab.
+    Fetch full merge request metadata from GitLab via MCP.
 
     Returns a MergeRequestDetails object with title, branches, author,
     changed files, and whether LLM components are detected.
     """
-    encoded_project = _encode_project_id(project_id)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # Fetch MR metadata
-        response = await client.get(
-            _api_url(f"/projects/{encoded_project}/merge_requests/{mr_id}"),
-            headers=_get_headers(),
+    try:
+        mr_data = await call_tool(
+            MCPServer.GITLAB,
+            "getMergeRequest",
+            {"projectId": project_id, "mergeRequestIid": mr_id},
         )
-        response.raise_for_status()
-        mr_data = response.json()
 
-        # Fetch MR changes (includes file diffs)
-        changes_response = await client.get(
-            _api_url(f"/projects/{encoded_project}/merge_requests/{mr_id}/changes"),
-            headers=_get_headers(),
+        changes_data = await call_tool(
+            MCPServer.GITLAB,
+            "getMergeRequestDiff",
+            {"projectId": project_id, "mergeRequestIid": mr_id},
         )
-        changes_response.raise_for_status()
-        changes_data = changes_response.json()
+    except (MCPConfigError, MCPCallError) as exc:
+        logger.error("GitLab MCP error fetching MR details: %s", exc)
+        raise
+
+    # Normalize response — MCP servers may return different shapes
+    if isinstance(mr_data, list) and mr_data:
+        mr_data = mr_data[0]
+    if not isinstance(mr_data, dict):
+        mr_data = {}
+
+    changes = changes_data if isinstance(changes_data, list) else (
+        changes_data.get("changes", []) if isinstance(changes_data, dict) else []
+    )
 
     # Extract changed files
     changed_files = [
         change.get("new_path", change.get("old_path", ""))
-        for change in changes_data.get("changes", [])
+        for change in changes
     ]
 
     # Detect Dockerfile
-    dockerfile_path = None
+    dockerfile_path: str | None = None
     for f in changed_files:
         if Path(f).name.lower() == "dockerfile":
             dockerfile_path = f
@@ -106,15 +93,15 @@ async def get_mr_details(project_id: str, mr_id: int) -> MergeRequestDetails:
             "Dockerfile",
         )
 
-    # LLM detection is performed separately via orchestrator/llm_detector.py
-    # (two-stage AST scan — not string matching, which produces false positives)
     return MergeRequestDetails(
         mr_id=mr_data.get("iid", mr_id),
         title=mr_data.get("title", ""),
         description=mr_data.get("description", ""),
         source_branch=mr_data.get("source_branch", ""),
         target_branch=mr_data.get("target_branch", ""),
-        author=mr_data.get("author", {}).get("username", "unknown"),
+        author=mr_data.get("author", {}).get("username", "unknown")
+        if isinstance(mr_data.get("author"), dict)
+        else mr_data.get("author", "unknown"),
         changed_files=changed_files,
         dockerfile_path=dockerfile_path,
         ci_config_path=mr_data.get("ci_config_path", ".gitlab-ci.yml") or ".gitlab-ci.yml",
@@ -124,19 +111,23 @@ async def get_mr_details(project_id: str, mr_id: int) -> MergeRequestDetails:
 
 
 async def get_mr_diff(project_id: str, mr_id: int) -> list[FileDiff]:
-    """Fetch the full code diff for a merge request."""
-    encoded_project = _encode_project_id(project_id)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            _api_url(f"/projects/{encoded_project}/merge_requests/{mr_id}/changes"),
-            headers=_get_headers(),
+    """Fetch the full code diff for a merge request via MCP."""
+    try:
+        data = await call_tool(
+            MCPServer.GITLAB,
+            "getMergeRequestDiff",
+            {"projectId": project_id, "mergeRequestIid": mr_id},
         )
-        response.raise_for_status()
-        data = response.json()
+    except (MCPConfigError, MCPCallError) as exc:
+        logger.error("GitLab MCP error fetching diff: %s", exc)
+        raise
+
+    changes = data if isinstance(data, list) else (
+        data.get("changes", []) if isinstance(data, dict) else []
+    )
 
     diffs = []
-    for change in data.get("changes", []):
+    for change in changes:
         diffs.append(FileDiff(
             old_path=change.get("old_path", ""),
             new_path=change.get("new_path", ""),
@@ -152,44 +143,61 @@ async def get_mr_diff(project_id: str, mr_id: int) -> list[FileDiff]:
 
 async def get_file_content(project_id: str, ref: str, filepath: str) -> str | None:
     """
-    Read a file's content from the GitLab repository at a specific ref.
+    Read a file's content from the GitLab repository at a specific ref via MCP.
     Returns None if the file does not exist.
     """
-    encoded_project = _encode_project_id(project_id)
-    encoded_filepath = filepath.replace("/", "%2F")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            _api_url(
-                f"/projects/{encoded_project}/repository/files/{encoded_filepath}/raw"
-            ),
-            params={"ref": ref},
-            headers=_get_headers(),
+    try:
+        result = await call_tool(
+            MCPServer.GITLAB,
+            "getRepositoryFiles",
+            {"projectId": project_id, "ref": ref, "filePath": filepath},
         )
-        if response.status_code == 404:
-            logger.debug("File not found: %s @ %s", filepath, ref)
+    except MCPConfigError:
+        raise
+    except MCPCallError as exc:
+        # File not found signals return None rather than propagating
+        if "not found" in str(exc).lower() or "404" in str(exc):
+            logger.debug("File not found via MCP: %s @ %s", filepath, ref)
             return None
-        response.raise_for_status()
-        return response.text
+        logger.warning("GitLab MCP error fetching file %s: %s", filepath, exc)
+        return None
+
+    if result is None:
+        return None
+
+    # MCP server may return the file content directly or wrapped
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return result.get("content") or result.get("blob") or result.get("raw_content")
+    return None
 
 
 async def post_mr_comment(project_id: str, mr_id: int, body: str) -> int | None:
     """
-    Post a comment (note) on a GitLab merge request.
+    Post a comment (note) on a GitLab merge request via MCP.
     Returns the note ID, or None on failure.
     """
-    encoded_project = _encode_project_id(project_id)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            _api_url(f"/projects/{encoded_project}/merge_requests/{mr_id}/notes"),
-            headers=_get_headers(),
-            json={"body": body},
+    try:
+        result = await call_tool(
+            MCPServer.GITLAB,
+            "createMergeRequestNote",
+            {
+                "projectId": project_id,
+                "mergeRequestIid": mr_id,
+                "body": body,
+            },
         )
-        response.raise_for_status()
-        note_data = response.json()
+    except (MCPConfigError, MCPCallError) as exc:
+        logger.error("GitLab MCP error posting comment: %s", exc)
+        return None
 
-    note_id = note_data.get("id")
+    note_id: int | None = None
+    if isinstance(result, dict):
+        note_id = result.get("id")
+    elif isinstance(result, int):
+        note_id = result
+
     logger.info("Posted comment on MR !%d: note_id=%s", mr_id, note_id)
     return note_id
 
@@ -202,7 +210,7 @@ async def set_pipeline_status(
     target_url: str = "",
 ) -> None:
     """
-    Set a commit status check on a GitLab commit.
+    Set a commit status check on a GitLab commit via MCP.
 
     Creates the 'Bulwark/production-ready' pipeline status that gates the MR.
 
@@ -213,24 +221,22 @@ async def set_pipeline_status(
         description: Human-readable status description
         target_url: Optional URL to the full simulation report
     """
-    encoded_project = _encode_project_id(project_id)
-
-    payload = {
+    payload: dict = {
+        "projectId": project_id,
+        "sha": sha,
         "state": state,
         "name": "Bulwark/production-ready",
         "description": description,
         "context": "Bulwark/production-ready",
     }
     if target_url:
-        payload["target_url"] = target_url
+        payload["targetUrl"] = target_url
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            _api_url(f"/projects/{encoded_project}/statuses/{sha}"),
-            headers=_get_headers(),
-            json=payload,
-        )
-        response.raise_for_status()
+    try:
+        await call_tool(MCPServer.GITLAB, "createPipelineStatus", payload)
+    except (MCPConfigError, MCPCallError) as exc:
+        logger.error("GitLab MCP error setting pipeline status: %s", exc)
+        raise
 
     logger.info(
         "Set pipeline status for %s: %s (%s)",
@@ -246,33 +252,36 @@ async def update_mr_approval(
     approve: bool,
 ) -> None:
     """
-    Approve or unapprove a merge request.
+    Approve or unapprove a merge request via MCP.
 
     Args:
         approve: True to approve, False to unapprove
     """
-    encoded_project = _encode_project_id(project_id)
-    endpoint = "approve" if approve else "unapprove"
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            _api_url(
-                f"/projects/{encoded_project}/merge_requests/{mr_id}/{endpoint}"
-            ),
-            headers=_get_headers(),
+    try:
+        await call_tool(
+            MCPServer.GITLAB,
+            "updateMergeRequest",
+            {
+                "projectId": project_id,
+                "mergeRequestIid": mr_id,
+                "action": "approve" if approve else "unapprove",
+            },
         )
-        # 401 can happen if the PAT doesn't have approval rights — log but don't fail
-        if response.status_code in (401, 403):
+    except MCPConfigError:
+        raise
+    except MCPCallError as exc:
+        # Approval rights may not be available — log but don't fail
+        if "403" in str(exc) or "401" in str(exc) or "insufficient" in str(exc).lower():
             logger.warning(
-                "Cannot %s MR !%d — insufficient permissions (status=%d)",
-                endpoint,
+                "Cannot %s MR !%d — insufficient permissions: %s",
+                "approve" if approve else "unapprove",
                 mr_id,
-                response.status_code,
+                exc,
             )
             return
-        response.raise_for_status()
+        raise
 
-    logger.info("MR !%d %sd", mr_id, endpoint)
+    logger.info("MR !%d %sd", mr_id, "approve" if approve else "unapprove")
 
 
 # ──────────────────────────────────────────────
@@ -287,7 +296,7 @@ async def get_file_contents_batch(
     concurrency: int = 5,
 ) -> dict[str, str]:
     """
-    Fetch the content of multiple files concurrently.
+    Fetch the content of multiple files concurrently via MCP.
     Used by the LLM detector for Stage 2 AST scanning.
 
     Returns dict of {filepath: content}. Files that 404 are excluded.

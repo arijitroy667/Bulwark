@@ -13,16 +13,46 @@ v3 additions:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, IndexModel
+from pymongo.errors import AutoReconnect, ServerSelectionTimeoutError
 
 from shared.config import settings
 
 logger = logging.getLogger("bulwark.db")
+
+# Phase 5: bounded retries for MongoDB writes
+def with_mongo_retry(max_retries: int = 3, initial_backoff: float = 1.0):
+    """Decorator to retry MongoDB operations on transient errors (AutoReconnect, ServerSelectionTimeoutError)."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except (AutoReconnect, ServerSelectionTimeoutError) as exc:
+                    last_exc = exc
+                    if attempt < max_retries:
+                        backoff = initial_backoff * (2 ** attempt)
+                        logger.warning(
+                            "MongoDB error in %s: %s (attempt %d/%d). Retrying in %.1fs...",
+                            func.__name__, exc, attempt + 1, max_retries + 1, backoff
+                        )
+                        await asyncio.sleep(backoff)
+            logger.error(
+                "MongoDB error in %s: %s (all retries exhausted)",
+                func.__name__, last_exc
+            )
+            raise last_exc
+        return wrapper
+    return decorator
 
 # ──────────────────────────────────────────────
 # Client singleton
@@ -71,7 +101,14 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
         IndexModel([("status", ASCENDING)]),
         IndexModel([("project_id", ASCENDING), ("created_at", DESCENDING)]),
         IndexModel([("service_name", ASCENDING), ("created_at", DESCENDING)]),
-        IndexModel([("created_at", DESCENDING)]),  # For 90-day TTL queries
+        IndexModel([("created_at", DESCENDING)]),  # For time-range queries
+        # Phase 5: 90-day TTL — MongoDB automatically deletes documents after
+        # 90 days (7776000 seconds). Requires ASCENDING order on the TTL field.
+        IndexModel(
+            [("created_at", ASCENDING)],
+            expireAfterSeconds=7776000,
+            name="simulations_ttl_90d",
+        ),
     ])
 
     verdicts = db["verdicts"]
@@ -94,6 +131,7 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
 # ──────────────────────────────────────────────
 
 
+@with_mongo_retry()
 async def create_simulation(simulation: dict[str, Any]) -> str:
     """Insert a new simulation record. Returns the simulation_id."""
     db = await get_database()
@@ -102,6 +140,7 @@ async def create_simulation(simulation: dict[str, Any]) -> str:
     return str(result.inserted_id)
 
 
+@with_mongo_retry()
 async def update_simulation(simulation_id: str, update: dict[str, Any]) -> None:
     """Update fields on an existing simulation record."""
     db = await get_database()
@@ -142,6 +181,7 @@ async def simulation_exists_by_sha(mr_id: int, head_sha: str) -> bool:
     return count > 0
 
 
+@with_mongo_retry()
 async def cancel_in_progress_simulation(mr_id: int, new_head_sha: str) -> int:
     """
     Cancel any in-progress simulations for this MR that have a different head_sha.
@@ -215,6 +255,7 @@ async def get_historical_context(service_name: str, limit: int = 5) -> list[dict
     return await cursor.to_list(length=limit)
 
 
+@with_mongo_retry()
 async def log_override_event(
     simulation_id: str,
     mr_id: int,
@@ -250,6 +291,7 @@ async def log_override_event(
 # ──────────────────────────────────────────────
 
 
+@with_mongo_retry()
 async def save_verdict(simulation_id: str, verdict: dict[str, Any]) -> None:
     """Save a verdict document linked to a simulation."""
     db = await get_database()
@@ -279,6 +321,7 @@ async def get_environment_config(service_name: str) -> dict[str, Any] | None:
     return await db["environment_configs"].find_one({"_id": service_name})
 
 
+@with_mongo_retry()
 async def save_environment_config(config: dict[str, Any]) -> None:
     """Upsert an environment configuration for a service."""
     db = await get_database()
@@ -318,3 +361,15 @@ async def list_simulations(
     cursor = collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
     docs = await cursor.to_list(length=limit)
     return docs, total
+
+
+@with_mongo_retry()
+async def enqueue_message(message_id: str, message_dict: dict[str, Any]) -> None:
+    """Queue a message to MongoDB message_queue (development mode)."""
+    db = await get_database()
+    await db["message_queue"].insert_one({
+        "_id": message_id,
+        "message": message_dict,
+        "processed": False,
+        "queued_at": datetime.now(timezone.utc),
+    })

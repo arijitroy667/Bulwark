@@ -273,6 +273,8 @@ class ReplayResult(BaseModel):
     five_xx_count: int = 0
     replay_duration_ms: int = 0
     individual_results: list[ReplayRequestResult] = Field(default_factory=list)
+    # Phase 4: set when replay is skipped due to insufficient real production samples
+    skip_reason: str | None = None
 
 
 # ──────────────────────────────────────────────

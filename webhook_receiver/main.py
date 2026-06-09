@@ -30,6 +30,8 @@ from shared.config import settings
 from shared.db import (
     cancel_in_progress_simulation,
     close_database,
+    create_simulation,
+    enqueue_message,
     get_database,
     simulation_exists_by_sha,
 )
@@ -197,13 +199,7 @@ async def _publish_to_queue(message: MREventMessage) -> None:
 
     if settings.bulwark_mode == "development":
         # Store in MongoDB for local development
-        db = await get_database()
-        await db["message_queue"].insert_one({
-            "_id": message.simulation_id,
-            "message": message_dict,
-            "processed": False,
-            "queued_at": datetime.now(timezone.utc),
-        })
+        await enqueue_message(message.simulation_id, message_dict)
         logger.info("Queued message to MongoDB: %s", message.simulation_id)
     else:
         publisher = await _get_publisher()
@@ -377,8 +373,7 @@ async def receive_gitlab_webhook(
 
     # ── Step 10: Create initial simulation record ──
     try:
-        db = await get_database()
-        await db["simulations"].insert_one({
+        await create_simulation({
             "_id": simulation_id,
             "mr_id": mr_id,
             "project_id": project_id,

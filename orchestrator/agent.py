@@ -56,6 +56,11 @@ from shared.models import (
 
 logger = logging.getLogger("bulwark.orchestrator")
 
+# Phase 4: minimum real production samples required for replay scoring
+# Per PLAN.md: "If fewer than 50, skip replay scoring and mark
+# 'insufficient real production samples'; do not fabricate probes."
+MIN_REPLAY_REQUESTS: int = 50
+
 
 # ──────────────────────────────────────────────
 # Main orchestration loop
@@ -222,6 +227,10 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
             error_log.append(error_msg)
             # MR metadata is critical — cannot continue without it
             await _fail_simulation(simulation_id, error_log, start_time)
+            return
+
+        # Phase 5: cancellation check between Steps 1 and 2
+        if await _should_abort_cancelled(simulation_id):
             return
 
         # ════════════════════════════════════════════
@@ -392,9 +401,20 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         try:
             from traffic_replay.replayer import replay_traffic
 
-            if not production_requests:
-                logger.warning("No production requests returned by Dynatrace — skipping replay")
-                replay_result = ReplayResult(simulation_id=simulation_id)
+            n_requests = len(production_requests)
+            if n_requests < MIN_REPLAY_REQUESTS:
+                # Phase 4: insufficient real samples — skip replay, do not fabricate
+                skip_msg = (
+                    f"Replay skipped: insufficient real production samples "
+                    f"(got {n_requests}, need ≥{MIN_REPLAY_REQUESTS}). "
+                    "Replay scoring will be absent from this verdict."
+                )
+                logger.warning(skip_msg)
+                error_log.append(skip_msg)
+                replay_result = ReplayResult(
+                    simulation_id=simulation_id,
+                    skip_reason=skip_msg,
+                )
             else:
                 replay_result = await replay_traffic(
                     environment=environment,
@@ -454,6 +474,12 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                     arize_result.relevance_delta or 0,
                     arize_result.groundedness_delta or 0,
                 )
+
+                # Phase 5: persist Arize dataset IDs immediately after eval
+                await update_simulation(simulation_id, {
+                    "arize.eval_dataset_id": arize_result.eval_dataset_id,
+                    "arize.baseline_dataset_id": arize_result.baseline_dataset_id,
+                })
 
             except Exception as e:
                 error_msg = f"Step 6 (ARIZE EVAL) failed: {e}"
@@ -523,10 +549,15 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
             logger.error(error_msg)
             error_log.append(error_msg)
 
-            # Fallback to local scoring
+            # Fallback to local scoring — Phase 5: mark model as deterministic-fallback
             from orchestrator.reasoning import compute_scores_locally
             verdict = compute_scores_locally(replay_result, baseline, arize_result if has_llm_components else None)
-            logger.info("Fallback verdict: %s (%d/100)", verdict.verdict.value, verdict.overall_score)
+            verdict.gemini_model = "deterministic-fallback"
+            logger.info("Fallback verdict: %s (%d/100) [deterministic-fallback]", verdict.verdict.value, verdict.overall_score)
+
+        # Phase 5: cancellation check between Steps 8 and 9
+        if await _should_abort_cancelled(simulation_id):
+            return
 
         # ════════════════════════════════════════════
         # STEP 9: ENFORCE [GitLab MCP]

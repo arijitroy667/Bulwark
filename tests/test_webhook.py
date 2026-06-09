@@ -48,6 +48,7 @@ mock_collection.insert_one = AsyncMock()
 mock_db = MagicMock()
 mock_db.__getitem__.return_value = mock_collection
 
+patch("shared.db.get_database", new_callable=AsyncMock, return_value=mock_db).start()
 patch("webhook_receiver.main.get_database", new_callable=AsyncMock, return_value=mock_db).start()
 # v3: patch updated idempotency function
 patch("webhook_receiver.main.simulation_exists_by_sha", new_callable=AsyncMock, return_value=False).start()

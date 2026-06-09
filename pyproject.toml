@@ -1,6 +1,6 @@
 [project]
 name = "bulwark"
-version = "1.0.0"
+version = "3.0.0"
 description = "Pre-Deployment Production Simulation Agent"
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,9 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "motor>=3.7.0",
     "pymongo>=4.10.0",
+    "mcp>=1.9.0",
     "google-cloud-pubsub>=2.28.0",
+    "google-cloud-storage>=2.19.0",
     "google-cloud-run>=0.10.0",
     "google-cloud-artifact-registry>=1.14.0",
     "google-cloud-build>=3.31.0",

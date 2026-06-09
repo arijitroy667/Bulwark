@@ -211,6 +211,9 @@ def _build_uncertainty_acknowledgement(replay: ReplayResult, baseline: ServiceBa
     Build the mandatory uncertainty disclosure block (PRD §8.7).
     Must appear verbatim in every MR comment.
     """
+    if replay.skip_reason:
+        return f"Replay skipped: {replay.skip_reason}"
+
     delta_multiple = ""
     if replay.latency_delta_p95_ms > P95_NOISE_FLOOR_MS and P95_NOISE_FLOOR_MS > 0:
         multiple = replay.latency_delta_p95_ms / P95_NOISE_FLOOR_MS
@@ -255,34 +258,37 @@ def compute_scores_locally(
 
     # Build evidence list
     evidence: list[str] = []
-    delta_p95 = replay_result.latency_delta_p95_ms
-    if delta_p95 > P95_NOISE_FLOOR_MS:
-        evidence.append(
-            f"p95 latency increased from {baseline.p95_latency_ms:.0f}ms to "
-            f"{replay_result.actual_p95_ms:.0f}ms (+{delta_p95:.0f}ms — "
-            f"{delta_p95/P95_NOISE_FLOOR_MS:.1f}x measurement noise floor of ±{P95_NOISE_FLOOR_MS:.0f}ms)"
-        )
+    if replay_result.skip_reason:
+        evidence.append(replay_result.skip_reason)
     else:
-        evidence.append(
-            f"p95 latency delta +{delta_p95:.1f}ms — within ±{P95_NOISE_FLOOR_MS:.0f}ms noise floor, not scored"
-        )
+        delta_p95 = replay_result.latency_delta_p95_ms
+        if delta_p95 > P95_NOISE_FLOOR_MS:
+            evidence.append(
+                f"p95 latency increased from {baseline.p95_latency_ms:.0f}ms to "
+                f"{replay_result.actual_p95_ms:.0f}ms (+{delta_p95:.0f}ms — "
+                f"{delta_p95/P95_NOISE_FLOOR_MS:.1f}x measurement noise floor of ±{P95_NOISE_FLOOR_MS:.0f}ms)"
+            )
+        else:
+            evidence.append(
+                f"p95 latency delta +{delta_p95:.1f}ms — within ±{P95_NOISE_FLOOR_MS:.0f}ms noise floor, not scored"
+            )
 
-    delta_err = replay_result.error_rate_delta_percent
-    if delta_err > ERROR_RATE_NOISE_FLOOR:
-        evidence.append(
-            f"Error rate increased {delta_err:+.2f}% above noise floor — regression signal"
-        )
-    else:
-        evidence.append(
-            f"Error rate delta {delta_err:+.2f}% — within ±{ERROR_RATE_NOISE_FLOOR:.1f}% noise floor, not scored"
-        )
+        delta_err = replay_result.error_rate_delta_percent
+        if delta_err > ERROR_RATE_NOISE_FLOOR:
+            evidence.append(
+                f"Error rate increased {delta_err:+.2f}% above noise floor — regression signal"
+            )
+        else:
+            evidence.append(
+                f"Error rate delta {delta_err:+.2f}% — within ±{ERROR_RATE_NOISE_FLOOR:.1f}% noise floor, not scored"
+            )
 
-    if replay_result.five_xx_count > 0:
-        evidence.append(f"5xx responses: {replay_result.five_xx_count} (binary signal — scored)")
+        if replay_result.five_xx_count > 0:
+            evidence.append(f"5xx responses: {replay_result.five_xx_count} (binary signal — scored)")
 
-    for error_msg in replay_result.novel_error_messages:
-        classification = (novel_error_classifications or {}).get(error_msg, "uncertain")
-        evidence.append(f"Novel error: \"{error_msg}\" — classified as {classification}")
+        for error_msg in replay_result.novel_error_messages:
+            classification = (novel_error_classifications or {}).get(error_msg, "uncertain")
+            evidence.append(f"Novel error: \"{error_msg}\" — classified as {classification}")
 
     summary_parts = []
     if verdict_status == VerdictStatus.BLOCKED:
@@ -501,6 +507,17 @@ def _build_gemini_prompt(
             f'  - "{e}"' for e in replay_result.novel_error_messages
         )
 
+    if replay_result.skip_reason:
+        simulation_results_text = f"Replay skipped: {replay_result.skip_reason}"
+    else:
+        simulation_results_text = f"""## Simulation Results ({replay_result.total_requests} requests replayed)
+- Actual p95 latency: {replay_result.actual_p95_ms:.0f}ms (delta: {replay_result.latency_delta_p95_ms:+.0f}ms)
+- Actual p50 latency: {replay_result.actual_p50_ms:.0f}ms
+- Actual error rate: {replay_result.actual_error_rate_percent:.2f}% (delta: {replay_result.error_rate_delta_percent:+.2f}%)
+- 5xx responses: {replay_result.five_xx_count}
+- Novel error messages (not in production baseline):
+{novel_errors_text}"""
+
     prompt = f"""You are Bulwark, a pre-deployment production simulation agent. Your task is to analyze the evidence below and produce a structured JSON verdict.
 
 ## Code Changes (diff summary)
@@ -516,13 +533,7 @@ Service: {service_name}
 - SLO p95 budget: {baseline.slo_latency_budget_p95_ms:.0f}ms
 - SLO error budget: {baseline.slo_error_budget_percent:.1f}%
 
-## Simulation Results ({replay_result.total_requests} requests replayed)
-- Actual p95 latency: {replay_result.actual_p95_ms:.0f}ms (delta: {replay_result.latency_delta_p95_ms:+.0f}ms)
-- Actual p50 latency: {replay_result.actual_p50_ms:.0f}ms
-- Actual error rate: {replay_result.actual_error_rate_percent:.2f}% (delta: {replay_result.error_rate_delta_percent:+.2f}%)
-- 5xx responses: {replay_result.five_xx_count}
-- Novel error messages (not in production baseline):
-{novel_errors_text}
+{simulation_results_text}
 
 ## Pre-computed Scores (deterministic threshold logic, PRD §8)
 - Infrastructure score: {pre_scores.infrastructure_score}/100
