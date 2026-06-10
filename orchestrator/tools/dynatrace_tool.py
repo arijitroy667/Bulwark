@@ -377,15 +377,37 @@ def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
         # ── Path 1: OpenTelemetry span attributes dict ──
         attributes = record.get("attributes")
         if isinstance(attributes, dict):
-            method = str(attributes.get("http.method", "")).upper()
-            raw_url = attributes.get("http.url", "") or attributes.get("http.target", "")
+            # Support both canonical OTel (http.method) and Bulwark's (request.method)
+            method = str(
+                attributes.get("http.method")
+                or attributes.get("request.method")
+                or ""
+            ).upper()
+            # Support http.url, http.target, url.path
+            raw_url = (
+                attributes.get("http.url")
+                or attributes.get("http.target")
+                or attributes.get("url.path")
+                or ""
+            )
             if raw_url:
                 parsed = urlparse(str(raw_url))
                 path = parsed.path or raw_url
-            expected_status = int(attributes.get("http.status_code", 200) or 200)
+            # Support http.status_code and http.response.status_code
+            expected_status = int(
+                attributes.get("http.status_code")
+                or attributes.get("http.response.status_code")
+                or 200
+            )
             # Also pull headers/body from OTel attributes
             raw_headers = attributes.get("http.request.headers", {})
             headers: dict[str, str] = raw_headers if isinstance(raw_headers, dict) else {}
+            # Also extract individual header attributes: http.request.header.<name>
+            header_prefix = "http.request.header."
+            for attr_key, attr_val in attributes.items():
+                if attr_key.startswith(header_prefix):
+                    header_name = attr_key[len(header_prefix):]
+                    headers[header_name] = str(attr_val)
             body_raw = attributes.get("http.request.body")
             if isinstance(body_raw, str):
                 try:

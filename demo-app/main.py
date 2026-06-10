@@ -225,3 +225,43 @@ async def get_metrics() -> dict:
         "user_count": len(MOCK_USERS),
         "wiremock_url": WIREMOCK_BASE_URL,
     }
+
+
+# ──────────────────────────────────────────────
+# /traces — LLM Observability Endpoint (PRD §6.3)
+# ──────────────────────────────────────────────
+
+
+@app.get("/traces")
+async def get_traces() -> dict:
+    """
+    Exposes LLM traces captured during the simulation.
+    Bulwark's orchestrator calls this at the end of the replay phase
+    to gather spans for Arize evaluation.
+    
+    In the real world, this would be backed by an in-memory buffer,
+    Redis, or a trace collector sink within the ephemeral environment.
+    """
+    if DEMO_VERSION != "llm-demo":
+        # Only return traces in the LLM demo scenario
+        return {"traces": []}
+
+    # Simulate traces captured during traffic replay
+    return {
+        "traces": [
+            {
+                "prompt": "Summarize this ticket: T-1234. Customer is asking for a refund.",
+                "response": "The customer requested a refund for ticket T-1234.",
+                "context": {"ticket_id": "T-1234", "user_tier": "premium"},
+                "model": "gemini-1.5-flash",
+                "latency_ms": 450,
+            },
+            {
+                "prompt": "Write a polite rejection email for feature request F-99.",
+                "response": "Thank you for the suggestion. Unfortunately, we cannot build F-99 right now.",
+                "context": {"feature_id": "F-99"},
+                "model": "gemini-1.5-flash",
+                "latency_ms": 380,
+            },
+        ]
+    }
