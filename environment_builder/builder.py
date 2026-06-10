@@ -182,13 +182,16 @@ async def _fetch_gitlab_archive(project_id: str, branch: str) -> bytes:
 
     Returns raw archive bytes.
     """
+    from shared.db import get_gitlab_pat
+    gitlab_pat = await get_gitlab_pat()
+
     encoded_project = project_id.replace("/", "%2F")
     archive_url = (
         f"{settings.gitlab_api_url}/projects/{encoded_project}"
         f"/repository/archive.tar.gz?sha={branch}"
     )
     headers = {
-        "PRIVATE-TOKEN": settings.gitlab_pat,
+        "PRIVATE-TOKEN": gitlab_pat,
         "Accept": "application/octet-stream",
     }
 

@@ -53,6 +53,16 @@ from shared.models import (
     SimulationStatus,
     VerdictResult,
 )
+from shared.demo_mode import (
+    is_demo_mode_active,
+    get_demo_baseline,
+    get_demo_topology,
+    get_demo_requests,
+    get_demo_arize_baseline,
+    get_demo_arize_eval,
+    launch_demo_app_subprocess,
+    terminate_demo_app_subprocess,
+)
 
 logger = logging.getLogger("bulwark.orchestrator")
 
@@ -97,9 +107,11 @@ async def run_simulation(message: MREventMessage) -> None:
             status=SimulationStatus.TIMED_OUT,
         )
         try:
-            from environment_builder.builder import teardown_environment
-
-            await teardown_environment(message.simulation_id)
+            if is_demo_mode_active():
+                await terminate_demo_app_subprocess(message.simulation_id)
+            else:
+                from environment_builder.builder import teardown_environment
+                await teardown_environment(message.simulation_id)
         except Exception as e:
             logger.error("Timed-out simulation teardown failed: %s", e)
 
@@ -244,51 +256,59 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         has_incident = False
         arize_baseline: dict = {}
 
-        async def _fetch_dynatrace_baseline() -> None:
-            nonlocal baseline, topology, production_requests, has_incident
-            try:
-                from orchestrator.tools.dynatrace_tool import (
-                    get_production_requests,
-                    get_service_baseline,
-                    get_service_topology,
-                    has_active_incident,
-                )
-                has_incident = await has_active_incident(service_name)
-                if has_incident:
+        if is_demo_mode_active():
+            logger.info("Demo mode: injecting synthetic baselines and request logs")
+            baseline = get_demo_baseline(service_name)
+            topology = get_demo_topology(service_name)
+            production_requests = get_demo_requests(service_name, settings.replay_request_limit)
+            if has_llm_components:
+                arize_baseline = get_demo_arize_baseline(service_name)
+        else:
+            async def _fetch_dynatrace_baseline() -> None:
+                nonlocal baseline, topology, production_requests, has_incident
+                try:
+                    from orchestrator.tools.dynatrace_tool import (
+                        get_production_requests,
+                        get_service_baseline,
+                        get_service_topology,
+                        has_active_incident,
+                    )
+                    has_incident = await has_active_incident(service_name)
+                    if has_incident:
+                        return
+                    baseline = await get_service_baseline(service_name)
+                    topology = await get_service_topology(service_name)
+                    production_requests = await get_production_requests(
+                        service_name, hours=24, limit=settings.replay_request_limit,
+                    )
+                    logger.info(
+                        "Baseline: p95=%.1fms, error=%.2f%%, requests=%d, deps=%d",
+                        baseline.p95_latency_ms,
+                        baseline.error_rate_percent,
+                        len(production_requests),
+                        len(topology.dependencies) if topology else 0,
+                    )
+                except Exception as e:
+                    error_msg = f"Step 2 (DYNATRACE BASELINE) failed: {e}"
+                    logger.error(error_msg)
+                    error_log.append(error_msg)
+
+            async def _fetch_arize_baseline() -> None:
+                nonlocal arize_baseline
+                if not has_llm_components:
+                    logger.debug("Step 3: Arize baseline skipped — no LLM components")
                     return
-                baseline = await get_service_baseline(service_name)
-                topology = await get_service_topology(service_name)
-                production_requests = await get_production_requests(
-                    service_name, hours=24, limit=settings.replay_request_limit,
-                )
-                logger.info(
-                    "Baseline: p95=%.1fms, error=%.2f%%, requests=%d, deps=%d",
-                    baseline.p95_latency_ms,
-                    baseline.error_rate_percent,
-                    len(production_requests),
-                    len(topology.dependencies) if topology else 0,
-                )
-            except Exception as e:
-                error_msg = f"Step 2 (DYNATRACE BASELINE) failed: {e}"
-                logger.error(error_msg)
-                error_log.append(error_msg)
+                try:
+                    from orchestrator.tools.arize_tool import get_llm_baseline
+                    arize_baseline = await get_llm_baseline(service_name)
+                    logger.info("Arize baseline fetched: dataset_id=%s", arize_baseline.get("dataset_id"))
+                except Exception as e:
+                    error_msg = f"Step 3 (ARIZE BASELINE) failed: {e}"
+                    logger.warning(error_msg)
+                    error_log.append(error_msg)
 
-        async def _fetch_arize_baseline() -> None:
-            nonlocal arize_baseline
-            if not has_llm_components:
-                logger.debug("Step 3: Arize baseline skipped — no LLM components")
-                return
-            try:
-                from orchestrator.tools.arize_tool import get_llm_baseline
-                arize_baseline = await get_llm_baseline(service_name)
-                logger.info("Arize baseline fetched: dataset_id=%s", arize_baseline.get("dataset_id"))
-            except Exception as e:
-                error_msg = f"Step 3 (ARIZE BASELINE) failed: {e}"
-                logger.warning(error_msg)
-                error_log.append(error_msg)
-
-        # Run both in parallel
-        await asyncio.gather(_fetch_dynatrace_baseline(), _fetch_arize_baseline())
+            # Run both in parallel
+            await asyncio.gather(_fetch_dynatrace_baseline(), _fetch_arize_baseline())
 
         if await _should_abort_cancelled(simulation_id):
             return
@@ -339,15 +359,29 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         })
 
         try:
-            from environment_builder.builder import provision_environment
+            if is_demo_mode_active():
+                # Determine version:
+                branch = message.source_branch.lower()
+                title = (mr_details.title.lower() if mr_details else "")
+                if "llm" in branch or "llm" in title:
+                    demo_version = "llm-demo"
+                elif "regression" in branch or "n-plus-one" in branch or "regression" in title or "n+1" in title:
+                    demo_version = "regression"
+                else:
+                    demo_version = "fixed"
+                
+                logger.info("Demo mode: launching demo app subprocess in '%s' mode", demo_version)
+                environment = await launch_demo_app_subprocess(simulation_id, demo_version)
+            else:
+                from environment_builder.builder import provision_environment
 
-            environment = await provision_environment(
-                simulation_id=simulation_id,
-                source_branch=message.source_branch,
-                project_id=message.project_id,
-                dockerfile_path=mr_details.dockerfile_path or "Dockerfile",
-                topology=topology,
-            )
+                environment = await provision_environment(
+                    simulation_id=simulation_id,
+                    source_branch=message.source_branch,
+                    project_id=message.project_id,
+                    dockerfile_path=mr_details.dockerfile_path or "Dockerfile",
+                    topology=topology,
+                )
 
             if environment.status.value not in ("healthy",):
                 error_msg = f"Environment unhealthy: {environment.status.value}"
@@ -452,21 +486,27 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                 "status": SimulationStatus.EVALUATING.value,
             })
             try:
-                from orchestrator.tools.arize_tool import log_spans, run_eval
+                if is_demo_mode_active():
+                    branch = message.source_branch.lower()
+                    title = (mr_details.title.lower() if mr_details else "")
+                    is_regression = ("regression" in branch or "n-plus-one" in branch or "regression" in title or "n+1" in title)
+                    arize_result = get_demo_arize_eval(simulation_id, has_llm_components, is_regression)
+                else:
+                    from orchestrator.tools.arize_tool import log_spans, run_eval
 
-                llm_outputs = await _extract_llm_outputs_from_replay(environment)
+                    llm_outputs = await _extract_llm_outputs_from_replay(environment)
 
-                arize_result = await run_eval(
-                    simulation_id=simulation_id,
-                    simulation_outputs=llm_outputs,
-                    baseline_dataset_id=arize_baseline.get("dataset_id"),
-                )
-                arize_result.llm_detected = True
+                    arize_result = await run_eval(
+                        simulation_id=simulation_id,
+                        simulation_outputs=llm_outputs,
+                        baseline_dataset_id=arize_baseline.get("dataset_id"),
+                    )
+                    arize_result.llm_detected = True
 
-                # Log spans (non-blocking)
-                if llm_outputs:
-                    await log_spans(simulation_id, llm_outputs)
-                    arize_result.arize_span_logged = True
+                    # Log spans (non-blocking)
+                    if llm_outputs:
+                        await log_spans(simulation_id, llm_outputs)
+                        arize_result.arize_span_logged = True
 
                 logger.info(
                     "Arize eval: hallucination_Δ=%.3f, relevance_Δ=%.3f, groundedness_Δ=%.3f",
@@ -504,8 +544,11 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         # ════════════════════════════════════════════
         logger.info("── Step 7: TEARDOWN ──")
         try:
-            from environment_builder.builder import teardown_environment
-            await teardown_environment(simulation_id)
+            if is_demo_mode_active():
+                await terminate_demo_app_subprocess(simulation_id)
+            else:
+                from environment_builder.builder import teardown_environment
+                await teardown_environment(simulation_id)
         except Exception as e:
             error_msg = f"Step 7 (TEARDOWN) failed: {e}"
             logger.error(error_msg)
@@ -619,8 +662,11 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
 
         # Always attempt teardown even on unexpected errors
         try:
-            from environment_builder.builder import teardown_environment
-            await teardown_environment(simulation_id)
+            if is_demo_mode_active():
+                await terminate_demo_app_subprocess(simulation_id)
+            else:
+                from environment_builder.builder import teardown_environment
+                await teardown_environment(simulation_id)
         except Exception:
             pass
 
@@ -662,9 +708,11 @@ async def _should_abort_cancelled(simulation_id: str, teardown: bool = False) ->
     logger.info("Simulation %s was cancelled — aborting stale workflow", simulation_id)
     if teardown:
         try:
-            from environment_builder.builder import teardown_environment
-
-            await teardown_environment(simulation_id)
+            if is_demo_mode_active():
+                await terminate_demo_app_subprocess(simulation_id)
+            else:
+                from environment_builder.builder import teardown_environment
+                await teardown_environment(simulation_id)
         except Exception as e:
             logger.error("Cancelled simulation teardown failed: %s", e)
     return True

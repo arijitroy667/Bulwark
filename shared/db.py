@@ -373,3 +373,56 @@ async def enqueue_message(message_id: str, message_dict: dict[str, Any]) -> None
         "processed": False,
         "queued_at": datetime.now(timezone.utc),
     })
+
+
+# ──────────────────────────────────────────────
+# GitLab PAT helpers (E2E Demo Mode)
+# ──────────────────────────────────────────────
+
+@with_mongo_retry()
+async def get_gitlab_pat() -> str:
+    """Fetch the active GitLab PAT from MongoDB, falling back to environment settings."""
+    try:
+        db = await get_database()
+        doc = await db["settings"].find_one({"_id": "gitlab"})
+        if doc and doc.get("pat"):
+            return doc["pat"]
+    except Exception:
+        pass
+    return settings.gitlab_pat
+
+
+@with_mongo_retry()
+async def save_gitlab_pat(pat: str) -> None:
+    """Save the active GitLab PAT to MongoDB."""
+    db = await get_database()
+    await db["settings"].replace_one(
+        {"_id": "gitlab"},
+        {"_id": "gitlab", "pat": pat},
+        upsert=True,
+    )
+
+
+@with_mongo_retry()
+async def get_demo_mode() -> bool:
+    """Fetch the active demo mode flag from MongoDB, falling back to environment settings."""
+    try:
+        db = await get_database()
+        doc = await db["settings"].find_one({"_id": "demo_mode"})
+        if doc and "active" in doc:
+            return doc["active"]
+    except Exception:
+        pass
+    return settings.bulwark_demo_mode
+
+
+@with_mongo_retry()
+async def save_demo_mode(active: bool) -> None:
+    """Save the active demo mode flag to MongoDB."""
+    db = await get_database()
+    await db["settings"].replace_one(
+        {"_id": "demo_mode"},
+        {"_id": "demo_mode", "active": active},
+        upsert=True,
+    )
+

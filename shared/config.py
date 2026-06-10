@@ -52,6 +52,7 @@ class BulwarkSettings(BaseSettings):
 
     # --- Bulwark Settings ---
     bulwark_mode: str = "development"  # development | production
+    bulwark_demo_mode: bool = False    # Run in demo mode (bypass real GCP/Dynatrace)
     simulation_timeout_seconds: int = 900  # 15 minutes hard ceiling (PRD §12.1)
     replay_concurrency: int = 10  # Default: 10× concurrent replay (FR-011)
     replay_request_limit: int = 200  # Max production request samples (FR-007)

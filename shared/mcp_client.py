@@ -27,6 +27,7 @@ from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.sse import sse_client
 
 from shared.config import settings
 
@@ -256,21 +257,26 @@ async def _do_call_with_retry(
 
 async def _do_call(url: str, tool_name: str, args: dict[str, Any]) -> Any:
     """
-    Execute a single MCP tool call using the streamable-HTTP transport.
+    Execute a single MCP tool call.
+    Uses SSE transport for /sse endpoints and streamable-HTTP for others.
 
     Opens a fresh session per call (stateless; no persistent connection kept
     between calls so that Cloud Run scale-to-zero is not impacted).
     """
     headers = _auth_headers()
 
-    async with streamablehttp_client(url, headers=headers) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments=args)
-
-    # result.content is a list[TextContent | ImageContent | EmbeddedResource]
-    # We parse the first TextContent item as the canonical result.
-    return _extract_result(result)
+    if url.endswith("/sse"):
+        async with sse_client(url, headers=headers) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments=args)
+        return _extract_result(result)
+    else:
+        async with streamablehttp_client(url, headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments=args)
+        return _extract_result(result)
 
 
 def _extract_result(result: Any) -> Any:

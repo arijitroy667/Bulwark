@@ -1,0 +1,1543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bulwark — Pre-Deployment Simulation Dashboard</title>
+    <!-- Modern Premium Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Harmonious Dark Palette */
+            --bg-base: hsl(220, 20%, 8%);
+            --bg-surface: hsla(220, 20%, 14%, 0.6);
+            --bg-surface-solid: hsl(220, 20%, 14%);
+            --border-color: hsla(220, 15%, 22%, 0.5);
+            --border-glow: hsla(260, 85%, 65%, 0.2);
+            
+            --text-primary: hsl(220, 15%, 95%);
+            --text-secondary: hsl(220, 10%, 70%);
+            --text-muted: hsl(220, 10%, 50%);
+            
+            /* Accents */
+            --accent-primary: hsl(260, 85%, 65%);     /* Purple */
+            --accent-secondary: hsl(200, 85%, 60%);   /* Blue */
+            --accent-gradient: linear-gradient(135deg, hsl(260, 85%, 65%), hsl(200, 85%, 60%));
+            
+            /* Verdict Colors */
+            --color-approved: hsl(145, 80%, 45%);
+            --color-warning: hsl(38, 90%, 55%);
+            --color-blocked: hsl(0, 85%, 60%);
+            
+            --font-outfit: 'Outfit', sans-serif;
+            --font-inter: 'Inter', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-inter);
+            min-height: 100vh;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            background-image: 
+                radial-gradient(at 0% 0%, hsla(260, 85%, 65%, 0.08) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, hsla(200, 85%, 60%, 0.08) 0px, transparent 50%);
+        }
+
+        /* Header styling */
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1.5rem 2.5rem;
+            border-bottom: 1px solid var(--border-color);
+            background-color: hsla(220, 20%, 8%, 0.7);
+            backdrop-filter: blur(12px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            font-size: 2.2rem;
+            filter: drop-shadow(0 0 10px hsla(260, 85%, 65%, 0.4));
+        }
+
+        .logo-text {
+            font-family: var(--font-outfit);
+            font-size: 1.8rem;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-badges {
+            display: flex;
+            gap: 1rem;
+        }
+
+        .badge {
+            background-color: var(--bg-surface-solid);
+            border: 1px solid var(--border-color);
+            padding: 0.4rem 0.8rem;
+            border-radius: 99px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .badge-pulse {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-muted);
+        }
+
+        .badge-pulse.active {
+            background-color: var(--color-approved);
+            box-shadow: 0 0 8px var(--color-approved);
+            animation: pulse 2s infinite;
+        }
+
+        .badge-pulse.demo {
+            background-color: var(--accent-secondary);
+            box-shadow: 0 0 8px var(--accent-secondary);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); opacity: 0.5; }
+            50% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(0.95); opacity: 0.5; }
+        }
+
+        /* Container Layout */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 420px 1fr;
+            gap: 2rem;
+            padding: 2rem 2.5rem;
+            max-width: 1600px;
+            margin: 0 auto;
+            width: 100%;
+            flex-grow: 1;
+        }
+
+        /* Left Column / Sidebar Panel */
+        .panel-sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .glass-card {
+            background: var(--bg-surface);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.75rem;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+            transition: var(--transition);
+        }
+
+        .glass-card:hover {
+            border-color: hsla(260, 85%, 65%, 0.3);
+            box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.4), 0 0 15px var(--border-glow);
+        }
+
+        h2 {
+            font-family: var(--font-outfit);
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        .input-wrapper {
+            position: relative;
+        }
+
+        input, select {
+            width: 100%;
+            background-color: hsl(220, 20%, 6%);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            font-family: var(--font-inter);
+            font-size: 0.95rem;
+            transition: var(--transition);
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px hsla(260, 85%, 65%, 0.15);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 0.85rem;
+            border-radius: 8px;
+            border: none;
+            font-family: var(--font-outfit);
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--accent-gradient);
+            color: var(--text-primary);
+            box-shadow: 0 4px 15px rgba(124, 58, 237, 0.3);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
+        }
+
+        .btn-primary:disabled {
+            background: var(--text-muted);
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-secondary {
+            background-color: var(--bg-surface-solid);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            background-color: hsl(220, 20%, 18%);
+            border-color: var(--text-muted);
+        }
+
+        .btn-secondary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background-color: hsl(220, 20%, 6%);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 26px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: var(--text-muted);
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px; width: 18px;
+            left: 4px; bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background: var(--accent-gradient);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(24px);
+        }
+
+        /* Right Column Dashboard */
+        .dashboard-content {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        /* Step list styling */
+        .pipeline-viewer {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .step-row {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: var(--transition);
+            cursor: pointer;
+        }
+
+        .step-row:hover {
+            background-color: hsla(220, 20%, 16%, 0.8);
+            border-color: hsla(220, 15%, 30%, 0.8);
+        }
+
+        .step-row.active {
+            border-color: var(--accent-secondary);
+            background-color: hsla(200, 85%, 60%, 0.05);
+            box-shadow: 0 0 10px hsla(200, 85%, 60%, 0.1);
+        }
+
+        .step-left {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .step-number {
+            font-family: var(--font-outfit);
+            font-weight: 700;
+            color: var(--accent-primary);
+            background-color: hsla(260, 85%, 65%, 0.1);
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+        }
+
+        .step-name {
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .step-desc {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.2rem;
+        }
+
+        .step-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--text-muted);
+        }
+
+        /* Step specific statuses */
+        .status-queued { background-color: var(--text-muted); }
+        
+        .status-running {
+            background-color: var(--accent-secondary);
+            box-shadow: 0 0 8px var(--accent-secondary);
+            animation: pulse-running 1.5s infinite;
+        }
+
+        @keyframes pulse-running {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.6; }
+        }
+
+        .status-success {
+            background-color: var(--color-approved);
+            box-shadow: 0 0 8px var(--color-approved);
+        }
+
+        .status-failed {
+            background-color: var(--color-blocked);
+            box-shadow: 0 0 8px var(--color-blocked);
+        }
+
+        /* Console styling */
+        .console-card {
+            background-color: hsl(220, 25%, 5%);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.25rem;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            height: 200px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            box-shadow: inset 0 4px 20px rgba(0,0,0,0.5);
+            scrollbar-width: thin;
+            scrollbar-color: var(--border-color) transparent;
+        }
+
+        .console-card::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .console-card::-webkit-scrollbar-thumb {
+            background-color: var(--border-color);
+            border-radius: 3px;
+        }
+
+        .console-line {
+            line-height: 1.4;
+            color: var(--text-secondary);
+        }
+
+        .console-line.info { color: var(--text-primary); }
+        .console-line.success { color: var(--color-approved); }
+        .console-line.warn { color: var(--color-warning); }
+        .console-line.error { color: var(--color-blocked); font-weight: 500; }
+
+        /* Verdict Card Styling */
+        .verdict-card {
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2rem;
+            background: var(--bg-surface);
+            display: none; /* Shown dynamically */
+            flex-direction: column;
+            gap: 1.5rem;
+            animation: fadeInUp 0.5s ease-out;
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .verdict-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1.25rem;
+        }
+
+        .verdict-badge {
+            font-family: var(--font-outfit);
+            font-size: 1.8rem;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .verdict-badge.approved { color: var(--color-approved); }
+        .verdict-badge.warning { color: var(--color-warning); }
+        .verdict-badge.blocked { color: var(--color-blocked); }
+
+        .score-circle-container {
+            position: relative;
+            width: 90px;
+            height: 90px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .score-svg {
+            transform: rotate(-90deg);
+            width: 100%;
+            height: 100%;
+        }
+
+        .score-track {
+            fill: none;
+            stroke: hsla(220, 15%, 22%, 0.8);
+            stroke-width: 8px;
+        }
+
+        .score-value {
+            fill: none;
+            stroke-width: 8px;
+            stroke-linecap: round;
+            transition: stroke-dashoffset 1s ease-in-out;
+        }
+
+        .score-text-val {
+            position: absolute;
+            font-family: var(--font-outfit);
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .grid-scores {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+        }
+
+        .subscore-box {
+            background-color: hsla(220, 20%, 6%, 0.4);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .subscore-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.35rem;
+        }
+
+        .subscore-val {
+            font-family: var(--font-outfit);
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+
+        /* Metrics Table */
+        .metrics-table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: var(--bg-surface-solid);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .metric-status-badge {
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            display: inline-block;
+        }
+
+        .status-badge-ok {
+            background-color: hsla(145, 80%, 45%, 0.15);
+            color: var(--color-approved);
+            border: 1px solid hsla(145, 80%, 45%, 0.3);
+        }
+
+        .status-badge-fail {
+            background-color: hsla(0, 85%, 60%, 0.15);
+            color: var(--color-blocked);
+            border: 1px solid hsla(0, 85%, 60%, 0.3);
+        }
+
+        .narrative-summary {
+            background-color: hsla(220, 20%, 6%, 0.4);
+            border-left: 4px solid var(--accent-primary);
+            padding: 1rem 1.25rem;
+            border-radius: 0 8px 8px 0;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: var(--text-secondary);
+        }
+
+        .historical-box {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            border-top: 1px solid var(--border-color);
+            padding-top: 1rem;
+        }
+
+        /* Dropdown custom styling */
+        .select-wrapper {
+            position: relative;
+        }
+
+        /* Recent runs history */
+        .recent-runs-panel {
+            margin-top: auto;
+        }
+
+        .recent-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            max-height: 180px;
+            overflow-y: auto;
+        }
+
+        .recent-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.6rem 0.8rem;
+            background-color: hsl(220, 20%, 6%);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .recent-item:hover {
+            border-color: var(--text-secondary);
+            background-color: var(--bg-surface-solid);
+        }
+
+        .recent-verdict-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .unsupported-banner {
+            display: none;
+            background-color: hsla(0, 85%, 60%, 0.1);
+            border: 1px solid hsla(0, 85%, 60%, 0.2);
+            color: var(--color-blocked);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="logo-container">
+            <span class="logo-icon">🛡️</span>
+            <span class="logo-text">BULWARK</span>
+        </div>
+        <div class="status-badges">
+            <div class="badge">
+                <div id="gitlab-pulse" class="badge-pulse"></div>
+                <span id="gitlab-status-text">GitLab: Not Connected</span>
+            </div>
+            <div class="badge">
+                <div id="demo-pulse" class="badge-pulse demo"></div>
+                <span id="demo-status-text">E2E Demo Mode: Active</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="main-layout">
+        <!-- Control Sidebar -->
+        <div class="panel-sidebar">
+            <div id="error-banner" class="unsupported-banner"></div>
+
+            <!-- Configuration Card -->
+            <div class="glass-card">
+                <h2>⚙️ GitLab Configuration</h2>
+                
+                <div class="form-group">
+                    <label for="gitlab-pat-input">Personal Access Token (PAT)</label>
+                    <input type="password" id="gitlab-pat-input" placeholder="glpat-xxxxxxxxxxxxxxxxxxxx" />
+                </div>
+
+                <div class="form-group">
+                    <label for="gitlab-url-input">GitLab URL (Optional)</label>
+                    <input type="text" id="gitlab-url-input" value="https://gitlab.com" />
+                </div>
+
+                <button id="connect-btn" class="btn btn-primary">Connect GitLab</button>
+
+                <!-- Project & MR selection, hidden until connected -->
+                <div id="repo-selection-section" style="display: none; margin-top: 1.5rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
+                    <div class="form-group">
+                        <label for="project-select">Select GitLab Project</label>
+                        <select id="project-select">
+                            <option value="">-- Choose Repository --</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="mr-select">Select Merge Request</label>
+                        <select id="mr-select" disabled>
+                            <option value="">-- Choose MR --</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group" style="margin-top: 1.5rem;">
+                        <label>Auto-Setup Webhook URL</label>
+                        <input type="text" id="webhook-url-input" placeholder="https://<your-ngrok-or-render>.com" style="margin-bottom: 0.5rem;" />
+                        <button id="setup-webhook-btn" class="btn btn-secondary" disabled>Auto-Configure Webhook</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- E2E Controls Card -->
+            <div class="glass-card">
+                <h2>🚀 Trigger Controls</h2>
+                
+                <div class="form-group">
+                    <div class="toggle-container">
+                        <span style="font-size: 0.85rem; font-weight: 500;">Run E2E Demo Mode</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="demo-mode-toggle" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <p style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.5rem; line-height: 1.3;">
+                        Bypasses Google Cloud build waits and injects mock metrics while preserving full reasoning and Git feedback logic.
+                    </p>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-top: 1.5rem;">
+                    <button id="trigger-btn" class="btn btn-primary" disabled>
+                        <span>⚡ Run E2E Simulation</span>
+                    </button>
+                    <button id="simulate-webhook-btn" class="btn btn-secondary" disabled>
+                        <span>🔄 Simulate Webhook Trigger</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Recent Runs Card -->
+            <div class="glass-card recent-runs-panel">
+                <h2>📊 Recent Simulations</h2>
+                <div id="recent-list" class="recent-list">
+                    <p style="font-size: 0.85rem; color: var(--text-muted); padding: 1rem; text-align: center;">No simulations recorded yet.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard Console & Stepper -->
+        <div class="dashboard-content">
+            <!-- Steps Viewer -->
+            <div class="glass-card">
+                <h2>📈 Pre-Deployment Simulation Pipeline</h2>
+                
+                <div class="pipeline-viewer">
+                    <!-- Step 1 -->
+                    <div class="step-row" id="step-1" data-step-num="1">
+                        <div class="step-left">
+                            <div class="step-number">1</div>
+                            <div>
+                                <div class="step-name">INGEST (GitLab MCP)</div>
+                                <div class="step-desc">Fetch MR metadata and run two-stage AST scannable LLM component detection</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-1-dot"></span>
+                            <span id="step-1-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 2 -->
+                    <div class="step-row" id="step-2" data-step-num="2">
+                        <div class="step-left">
+                            <div class="step-number">2</div>
+                            <div>
+                                <div class="step-name">FETCH PERFORMANCE BASELINE (Dynatrace MCP)</div>
+                                <div class="step-desc">Retrieve 24h production latency, error rate, throughput and SLO metrics</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-2-dot"></span>
+                            <span id="step-2-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 3 -->
+                    <div class="step-row" id="step-3" data-step-num="3">
+                        <div class="step-left">
+                            <div class="step-number">3</div>
+                            <div>
+                                <div class="step-name">FETCH LLM QUALITY BASELINE (Arize MCP)</div>
+                                <div class="step-desc">Get production evaluator baselines for hallucination and relevance (if LLM detected)</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-3-dot"></span>
+                            <span id="step-3-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 4 -->
+                    <div class="step-row" id="step-4" data-step-num="4">
+                        <div class="step-left">
+                            <div class="step-number">4</div>
+                            <div>
+                                <div class="step-name">PROVISION SIMULATION ENVIRONMENT</div>
+                                <div class="step-desc">Deploy ephemeral isolated service revision and automatically wire downstream API stubs</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-4-dot"></span>
+                            <span id="step-4-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 5 -->
+                    <div class="step-row" id="step-5" data-step-num="5">
+                        <div class="step-left">
+                            <div class="step-number">5</div>
+                            <div>
+                                <div class="step-name">REPLAY PRODUCTION TRAFFIC</div>
+                                <div class="step-desc">Anonymize and execute 200 real production requests at 10x concurrency</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-5-dot"></span>
+                            <span id="step-5-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 6 -->
+                    <div class="step-row" id="step-6" data-step-num="6">
+                        <div class="step-left">
+                            <div class="step-number">6</div>
+                            <div>
+                                <div class="step-name">RUN LLM QUALITY EVALUATORS (Arize MCP)</div>
+                                <div class="step-desc">Collect LLM spans and evaluate regression signals (hallucination, groundedness)</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-6-dot"></span>
+                            <span id="step-6-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 7 -->
+                    <div class="step-row" id="step-7" data-step-num="7">
+                        <div class="step-left">
+                            <div class="step-number">7</div>
+                            <div>
+                                <div class="step-name">TEARDOWN EPHEMERAL RESOURCES</div>
+                                <div class="step-desc">Cleanly destroy ephemeral simulation service, WireMock, GCS source and Artifact tags</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-7-dot"></span>
+                            <span id="step-7-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 8 -->
+                    <div class="step-row" id="step-8" data-step-num="8">
+                        <div class="step-left">
+                            <div class="step-number">8</div>
+                            <div>
+                                <div class="step-name">GEMINI REASONING ENGINE</div>
+                                <div class="step-desc">Analyze performance logs and novel errors against noise floors to render JSON verdict</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-8-dot"></span>
+                            <span id="step-8-text">Pending</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 9 -->
+                    <div class="step-row" id="step-9" data-step-num="9">
+                        <div class="step-left">
+                            <div class="step-number">9</div>
+                            <div>
+                                <div class="step-name">GITLAB ENFORCEMENT & GATE</div>
+                                <div class="step-desc">Post detailed markdown metrics comment and update GitLab commit pipeline status</div>
+                            </div>
+                        </div>
+                        <div class="step-status">
+                            <span class="status-dot status-queued" id="step-9-dot"></span>
+                            <span id="step-9-text">Pending</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Console Log Panel -->
+            <div class="glass-card">
+                <h2>💻 Execution Console Output</h2>
+                <div id="console" class="console-card">
+                    <div class="console-line info">Select a simulation to stream live execution logs...</div>
+                </div>
+            </div>
+
+            <!-- Verdict Details Card -->
+            <div id="verdict-container" class="verdict-card">
+                <div class="verdict-header">
+                    <div id="verdict-val" class="verdict-badge approved">
+                        <span>✅ APPROVED</span>
+                    </div>
+                    
+                    <div class="score-circle-container">
+                        <svg class="score-svg" viewBox="0 0 36 36">
+                            <path class="score-track" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                            <path id="score-circle-path" class="score-value" stroke="var(--color-approved)" stroke-dasharray="100, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                        </svg>
+                        <span id="score-text" class="score-text-val">91</span>
+                    </div>
+                </div>
+
+                <div class="grid-scores">
+                    <div class="subscore-box">
+                        <div class="subscore-label">Infrastructure Score</div>
+                        <div id="infra-score" class="subscore-val">100/100</div>
+                    </div>
+                    <div class="subscore-box">
+                        <div class="subscore-label">Reliability Score</div>
+                        <div id="reliability-score" class="subscore-val">100/100</div>
+                    </div>
+                    <div class="subscore-box">
+                        <div class="subscore-label">LLM Quality Score</div>
+                        <div id="llm-score" class="subscore-val">—</div>
+                    </div>
+                </div>
+
+                <div class="metrics-table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Production Baseline</th>
+                                <th>Simulation Replay</th>
+                                <th>Delta</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="metrics-tbody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="narrative-summary">
+                    <h4 style="margin-bottom: 0.5rem; font-family: var(--font-outfit); font-weight:600; color: var(--text-primary);">Gemini Analysis & Rationale</h4>
+                    <p id="verdict-summary">The simulation completed successfully with latency deltas well within the established baseline noise floor. No regressions detected.</p>
+                </div>
+
+                <div id="historical-box" class="historical-box">
+                    <strong>Historical Context:</strong>
+                    <span id="historical-text">No prior simulations found for this service.</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Frontend logic -->
+    <script>
+        const API_BASE = "";
+        let activeSimulationId = null;
+        let pollInterval = null;
+
+        // UI elements
+        const patInput = document.getElementById("gitlab-pat-input");
+        const urlInput = document.getElementById("gitlab-url-input");
+        const connectBtn = document.getElementById("connect-btn");
+        const projectSelect = document.getElementById("project-select");
+        const mrSelect = document.getElementById("mr-select");
+        const triggerBtn = document.getElementById("trigger-btn");
+        const simulateWebhookBtn = document.getElementById("simulate-webhook-btn");
+        const setupWebhookBtn = document.getElementById("setup-webhook-btn");
+        const webhookUrlInput = document.getElementById("webhook-url-input");
+        const demoModeToggle = document.getElementById("demo-mode-toggle");
+        const repoSelectionSection = document.getElementById("repo-selection-section");
+        const consoleEl = document.getElementById("console");
+        const errorBanner = document.getElementById("error-banner");
+        const gitlabPulse = document.getElementById("gitlab-pulse");
+        const gitlabStatusText = document.getElementById("gitlab-status-text");
+        const demoStatusText = document.getElementById("demo-status-text");
+
+        // Initialization
+        window.addEventListener("DOMContentLoaded", async () => {
+            await fetchStatus();
+            await fetchRecentSimulations();
+            
+            // Connect GitLab handler
+            connectBtn.addEventListener("click", handleConnect);
+            projectSelect.addEventListener("click", fetchMRs);
+            projectSelect.addEventListener("change", handleProjectSelect);
+            mrSelect.addEventListener("change", handleMRSelect);
+            
+            // Webhook handler
+            setupWebhookBtn.addEventListener("click", handleSetupWebhook);
+            
+            // Trigger handlers
+            triggerBtn.addEventListener("click", () => handleTrigger(false));
+            simulateWebhookBtn.addEventListener("click", () => handleTrigger(true));
+            
+            // Demo mode toggle handler
+            demoModeToggle.addEventListener("change", handleDemoModeToggle);
+        });
+
+        async function fetchStatus() {
+            try {
+                const r = await fetch("/api/settings");
+                if (r.ok) {
+                    const data = await r.json();
+                    demoModeToggle.checked = data.demo_mode;
+                    updateDemoBadge(data.demo_mode);
+                    
+                    if (data.gitlab_connected) {
+                        patInput.value = data.gitlab_pat_masked || "";
+                        gitlabPulse.classList.add("active");
+                        gitlabStatusText.textContent = "GitLab: Connected";
+                        repoSelectionSection.style.display = "block";
+                        
+                        // Populate projects if already connected
+                        await loadProjects(data.projects || []);
+                    }
+                }
+            } catch (err) {
+                showError("Failed to fetch initial status: " + err);
+            }
+        }
+
+        function updateDemoBadge(active) {
+            if (active) {
+                demoStatusText.textContent = "E2E Demo Mode: Active";
+                document.getElementById("demo-pulse").style.backgroundColor = "var(--accent-secondary)";
+            } else {
+                demoStatusText.textContent = "E2E Demo Mode: Disabled";
+                document.getElementById("demo-pulse").style.backgroundColor = "var(--text-muted)";
+            }
+        }
+
+        async function handleDemoModeToggle() {
+            const active = demoModeToggle.checked;
+            try {
+                const r = await fetch("/api/settings/demo-mode", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ active })
+                });
+                if (r.ok) {
+                    updateDemoBadge(active);
+                    appendConsole(`Demo mode toggled to: ${active}`, "info");
+                }
+            } catch (err) {
+                showError("Failed to update demo mode: " + err);
+            }
+        }
+
+        async function handleConnect() {
+            const pat = patInput.value.trim();
+            const url = urlInput.value.trim();
+            
+            if (!pat) {
+                showError("Please enter a Personal Access Token (PAT)");
+                return;
+            }
+
+            connectBtn.disabled = true;
+            connectBtn.textContent = "Connecting...";
+            clearError();
+
+            try {
+                const r = await fetch("/api/gitlab/connect", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ gitlab_pat: pat, gitlab_url: url })
+                });
+
+                if (r.ok) {
+                    const data = await r.json();
+                    gitlabPulse.classList.add("active");
+                    gitlabStatusText.textContent = "GitLab: Connected";
+                    repoSelectionSection.style.display = "block";
+                    appendConsole("GitLab connected successfully. Loaded repositories.", "success");
+                    await loadProjects(data.projects);
+                } else {
+                    const errData = await r.json();
+                    showError(errData.detail || "Authentication failed");
+                }
+            } catch (err) {
+                showError("GitLab Connection error: " + err);
+            } finally {
+                connectBtn.disabled = false;
+                connectBtn.textContent = "Connect GitLab";
+            }
+        }
+
+        async function loadProjects(projects) {
+            projectSelect.innerHTML = '<option value="">-- Choose Repository --</option>';
+            projects.forEach(p => {
+                const opt = document.createElement("option");
+                opt.value = p.path_with_namespace;
+                opt.textContent = p.name_with_namespace;
+                projectSelect.appendChild(opt);
+            });
+        }
+
+        async function handleProjectSelect() {
+            const val = projectSelect.value;
+            if (!val) {
+                mrSelect.disabled = true;
+                setupWebhookBtn.disabled = true;
+                return;
+            }
+
+            mrSelect.innerHTML = '<option value="">-- Loading MRs... --</option>';
+            mrSelect.disabled = true;
+            setupWebhookBtn.disabled = false;
+
+            try {
+                const encoded = encodeURIComponent(val);
+                const r = await fetch(`/api/gitlab/projects/${encoded}/merge_requests`);
+                if (r.ok) {
+                    const data = await r.json();
+                    mrSelect.innerHTML = '<option value="">-- Choose MR --</option>';
+                    if (data.length === 0) {
+                        mrSelect.innerHTML = '<option value="">No open MRs found</option>';
+                    } else {
+                        data.forEach(mr => {
+                            const opt = document.createElement("option");
+                            opt.value = mr.iid;
+                            opt.textContent = `!${mr.iid} - ${mr.title} (${mr.source_branch})`;
+                            mrSelect.appendChild(opt);
+                        });
+                        mrSelect.disabled = false;
+                    }
+                }
+            } catch (err) {
+                showError("Failed to load MRs: " + err);
+            }
+        }
+
+        async function fetchMRs() {
+            // Placeholder trigger
+        }
+
+        function handleProjectSelect() {
+            // Already handled above
+        }
+
+        function handleMRSelect() {
+            const val = mrSelect.value;
+            triggerBtn.disabled = !val;
+            simulateWebhookBtn.disabled = !val;
+        }
+
+        async function handleSetupWebhook() {
+            const proj = projectSelect.value;
+            const webhookUrl = webhookUrlInput.value.trim();
+            if (!proj || !webhookUrl) {
+                showError("Please select a project and enter your public Webhook URL.");
+                return;
+            }
+
+            setupWebhookBtn.disabled = true;
+            setupWebhookBtn.textContent = "Configuring...";
+
+            try {
+                const r = await fetch("/api/gitlab/setup-webhook", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ project_id: proj, webhook_url: webhookUrl })
+                });
+
+                if (r.ok) {
+                    appendConsole(`Webhook registered successfully on ${proj}`, "success");
+                } else {
+                    const err = await r.json();
+                    showError("Webhook setup failed: " + (err.detail || "unknown error"));
+                }
+            } catch (err) {
+                showError("Webhook setup failed: " + err);
+            } finally {
+                setupWebhookBtn.disabled = false;
+                setupWebhookBtn.textContent = "Auto-Configure Webhook";
+            }
+        }
+
+        async function handleTrigger(simulateWebhook) {
+            const proj = projectSelect.value;
+            const mrId = mrSelect.value;
+            if (!proj || !mrId) return;
+
+            triggerBtn.disabled = true;
+            simulateWebhookBtn.disabled = true;
+            clearSteps();
+            clearVerdict();
+            
+            appendConsole(`Starting simulation for ${proj} MR !${mrId}...`, "info");
+
+            try {
+                const r = await fetch("/api/gitlab/simulate-trigger", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        project_id: proj,
+                        mr_id: parseInt(mrId),
+                        simulate_webhook: simulateWebhook
+                    })
+                });
+
+                if (r.ok) {
+                    const data = await r.json();
+                    activeSimulationId = data.simulation_id;
+                    appendConsole(`Simulation enqueued. ID: ${activeSimulationId}`, "success");
+                    startPolling(activeSimulationId);
+                    await fetchRecentSimulations();
+                } else {
+                    const err = await r.json();
+                    showError(err.detail || "Failed to trigger simulation");
+                    triggerBtn.disabled = false;
+                    simulateWebhookBtn.disabled = false;
+                }
+            } catch (err) {
+                showError("Trigger error: " + err);
+                triggerBtn.disabled = false;
+                simulateWebhookBtn.disabled = false;
+            }
+        }
+
+        function startPolling(simId) {
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(() => pollSimulation(simId), 1500);
+        }
+
+        async function pollSimulation(simId) {
+            try {
+                const r = await fetch(`/api/simulation/${simId}`);
+                if (r.ok) {
+                    const data = await r.json();
+                    updateStepper(data);
+                    
+                    // Stop polling if completed or failed
+                    const status = data.status;
+                    const stopStates = ["completed", "error", "build_failed", "build_timeout", "health_check_failed", "runtime_crash", "timed_out", "cancelled"];
+                    
+                    if (stopStates.includes(status)) {
+                        clearInterval(pollInterval);
+                        pollInterval = null;
+                        triggerBtn.disabled = false;
+                        simulateWebhookBtn.disabled = false;
+                        
+                        if (status === "completed") {
+                            renderVerdict(data);
+                        } else {
+                            showError(`Simulation ended with state: ${status.toUpperCase()}`);
+                        }
+                        await fetchRecentSimulations();
+                    }
+                }
+            } catch (err) {
+                console.error("Polling error: ", err);
+            }
+        }
+
+        function updateStepper(data) {
+            const status = data.status;
+            const errorLog = data.error_log || [];
+            
+            // Display logs in console
+            consoleEl.innerHTML = "";
+            
+            if (status === "queued") {
+                appendConsole("Simulation enqueued in MongoDB. Waiting for orchestrator...", "info");
+            }
+            
+            errorLog.forEach(log => {
+                let type = "info";
+                if (log.toLowerCase().includes("failed") || log.toLowerCase().includes("error") || log.toLowerCase().includes("timeout")) {
+                    type = "error";
+                } else if (log.toLowerCase().includes("skip") || log.toLowerCase().includes("warn")) {
+                    type = "warn";
+                }
+                appendConsole(log, type);
+            });
+
+            // Map current status to step index
+            const statusMap = {
+                "ingesting": 1,
+                "fetching_baseline": 2, // Steps 2 + 3 are parallel
+                "provisioning": 4,
+                "replaying": 5,
+                "evaluating": 6,
+                "teardown": 7,
+                "reasoning": 8,
+                "enforcing": 9
+            };
+
+            const currentStep = statusMap[status] || 0;
+
+            for (let i = 1; i <= 9; i++) {
+                const stepRow = document.getElementById(`step-${i}`);
+                const dot = document.getElementById(`step-${i}-dot`);
+                const text = document.getElementById(`step-${i}-text`);
+                
+                stepRow.classList.remove("active");
+                
+                if (i < currentStep) {
+                    // Completed steps
+                    dot.className = "status-dot status-success";
+                    text.textContent = "Done";
+                } else if (i === currentStep || (currentStep === 2 && (i === 2 || i === 3))) {
+                    // Current step
+                    stepRow.classList.add("active");
+                    dot.className = "status-dot status-running";
+                    text.textContent = "Running";
+                } else {
+                    // Future steps
+                    dot.className = "status-dot status-queued";
+                    text.textContent = "Pending";
+                }
+            }
+            
+            if (status === "completed") {
+                for (let i = 1; i <= 9; i++) {
+                    document.getElementById(`step-${i}-dot`).className = "status-dot status-success";
+                    document.getElementById(`step-${i}-text`).textContent = "Done";
+                }
+            }
+        }
+
+        function renderVerdict(data) {
+            const v = data.verdict;
+            if (!v) return;
+
+            const container = document.getElementById("verdict-container");
+            container.style.display = "flex";
+
+            const badge = document.getElementById("verdict-val");
+            badge.className = "verdict-badge " + v.verdict.toLowerCase();
+            badge.querySelector("span").textContent = `🛡️ ${v.verdict}`;
+
+            // Score circular progress
+            const circle = document.getElementById("score-circle-path");
+            const scoreText = document.getElementById("score-text");
+            scoreText.textContent = v.overall_score;
+            
+            // Circle circumference is 2 * pi * r = 2 * 3.14159 * 15.9155 = 100
+            circle.style.strokeDasharray = `${v.overall_score}, 100`;
+            
+            if (v.verdict === "APPROVED") {
+                circle.style.stroke = "var(--color-approved)";
+            } else if (v.verdict === "WARNING") {
+                circle.style.stroke = "var(--color-warning)";
+            } else {
+                circle.style.stroke = "var(--color-blocked)";
+            }
+
+            // Subscores
+            document.getElementById("infra-score").textContent = `${v.infrastructure_score}/100`;
+            document.getElementById("reliability-score").textContent = `${v.reliability_score}/100`;
+            document.getElementById("llm-score").textContent = v.llm_quality_score !== null ? `${v.llm_quality_score}/100` : "—";
+
+            // Narrative summary
+            document.getElementById("verdict-summary").textContent = v.summary;
+
+            // Historical context
+            const histText = document.getElementById("historical-text");
+            if (v.historical_note) {
+                histText.textContent = v.historical_note;
+            } else {
+                histText.textContent = "No prior simulation context.";
+            }
+
+            // Metrics table
+            const tbody = document.getElementById("metrics-tbody");
+            tbody.innerHTML = "";
+
+            const rep = data.dynatrace.replay_result || {};
+            const base = data.dynatrace.baseline || {};
+
+            const rows = [
+                {
+                    name: "p95 Latency",
+                    baseline: `${base.p95_latency_ms?.toFixed(1)}ms`,
+                    simulation: `${rep.actual_p95_ms?.toFixed(1)}ms`,
+                    delta: `+${rep.latency_delta_p95_ms?.toFixed(1)}ms`,
+                    status: rep.latency_delta_p95_ms > 35.0 ? "FAIL" : "OK"
+                },
+                {
+                    name: "Error Rate",
+                    baseline: `${base.error_rate_percent?.toFixed(2)}%`,
+                    simulation: `${rep.actual_error_rate_percent?.toFixed(2)}%`,
+                    delta: rep.error_rate_delta_percent ? `+${rep.error_rate_delta_percent.toFixed(2)}%` : "0%",
+                    status: rep.error_rate_delta_percent > 1.0 ? "FAIL" : "OK"
+                },
+                {
+                    name: "5xx Response Count",
+                    baseline: "0",
+                    simulation: rep.five_xx_count || "0",
+                    delta: rep.five_xx_count ? `+${rep.five_xx_count}` : "—",
+                    status: rep.five_xx_count > 0 ? "FAIL" : "OK"
+                }
+            ];
+
+            rows.forEach(r => {
+                const tr = document.createElement("tr");
+                const badgeClass = r.status === "OK" ? "status-badge-ok" : "status-badge-fail";
+                tr.innerHTML = `
+                    <td style="font-weight: 500;">${r.name}</td>
+                    <td>${r.baseline}</td>
+                    <td>${r.simulation}</td>
+                    <td style="font-family: var(--font-mono);">${r.delta}</td>
+                    <td><span class="metric-status-badge ${badgeClass}">${r.status}</span></td>
+                `;
+                tbody.appendChild(tr);
+            });
+            
+            appendConsole("Verdict rendered beautifully on dashboard.", "success");
+        }
+
+        async function fetchRecentSimulations() {
+            try {
+                const r = await fetch("/api/simulations");
+                if (r.ok) {
+                    const data = await r.json();
+                    const list = document.getElementById("recent-list");
+                    list.innerHTML = "";
+                    
+                    if (data.simulations.length === 0) {
+                        list.innerHTML = '<p style="font-size: 0.85rem; color: var(--text-muted); padding: 1rem; text-align: center;">No simulations recorded yet.</p>';
+                        return;
+                    }
+
+                    data.simulations.forEach(sim => {
+                        const item = document.createElement("div");
+                        item.className = "recent-item";
+                        
+                        let verdictColor = "var(--text-muted)";
+                        let verdictStr = sim.status.toUpperCase();
+                        
+                        if (sim.verdict) {
+                            verdictStr = `${sim.verdict.verdict} (${sim.verdict.overall_score}/100)`;
+                            if (sim.verdict.verdict === "APPROVED") verdictColor = "var(--color-approved)";
+                            else if (sim.verdict.verdict === "WARNING") verdictColor = "var(--color-warning)";
+                            else if (sim.verdict.verdict === "BLOCKED") verdictColor = "var(--color-blocked)";
+                        }
+
+                        item.innerHTML = `
+                            <div>
+                                <div style="font-weight: 600;">!${sim.mr_id} - ${sim.project_id}</div>
+                                <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">${sim._id}</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-weight: 500; color: ${verdictColor}">${verdictStr}</div>
+                            </div>
+                        `;
+                        
+                        item.addEventListener("click", () => {
+                            activeSimulationId = sim._id;
+                            startPolling(activeSimulationId);
+                            // Clear polling since it's already done
+                            pollSimulation(activeSimulationId).then(() => {
+                                if (pollInterval) {
+                                    clearInterval(pollInterval);
+                                    pollInterval = null;
+                                }
+                            });
+                        });
+                        
+                        list.appendChild(item);
+                    });
+                }
+            } catch (err) {
+                console.error("Recent simulations fetch failed: ", err);
+            }
+        }
+
+        // Error banners
+        function showError(msg) {
+            errorBanner.style.display = "block";
+            errorBanner.textContent = msg;
+        }
+
+        function clearError() {
+            errorBanner.style.display = "none";
+        }
+
+        function appendConsole(line, type = "info") {
+            const div = document.createElement("div");
+            div.className = `console-line ${type}`;
+            
+            const timestamp = new Date().toLocaleTimeString();
+            div.textContent = `[${timestamp}] ${line}`;
+            consoleEl.appendChild(div);
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+
+        function clearSteps() {
+            for (let i = 1; i <= 9; i++) {
+                document.getElementById(`step-${i}-dot`).className = "status-dot status-queued";
+                document.getElementById(`step-${i}-text`).textContent = "Pending";
+            }
+        }
+
+        function clearVerdict() {
+            document.getElementById("verdict-container").style.display = "none";
+        }
+    </script>
+</body>
+</html>

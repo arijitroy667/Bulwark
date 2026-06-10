@@ -24,11 +24,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
+import json
+from sse_starlette.sse import EventSourceResponse
 
 from orchestrator.agent import handle_pubsub_message
 from shared.config import settings
-from shared.db import close_database
+from shared.db import close_database, get_simulation, save_gitlab_pat, list_simulations
 
 logger = logging.getLogger("bulwark.orchestrator.worker")
 
@@ -69,6 +73,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add CORS middleware for the dashboard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ──────────────────────────────────────────────
 # Response models
@@ -86,6 +99,12 @@ class PubSubAckResponse(BaseModel):
     simulation_id: str | None = None
 
 
+class SetupRequest(BaseModel):
+    pat: str
+    project_id: str
+    webhook_url: str
+
+
 # ──────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────
@@ -95,6 +114,87 @@ class PubSubAckResponse(BaseModel):
 async def health_check() -> HealthResponse:
     """Liveness / readiness probe for Cloud Run."""
     return HealthResponse()
+
+
+@app.post("/api/setup", tags=["dashboard"])
+async def setup_project(request: SetupRequest):
+    """Save PAT and auto-configure GitLab webhook for the given project."""
+    await save_gitlab_pat(request.pat)
+    
+    # Configure webhook on GitLab
+    gitlab_url = settings.gitlab_url.rstrip('/')
+    url = f"{gitlab_url}/api/v4/projects/{request.project_id}/hooks"
+    headers = {
+        "PRIVATE-TOKEN": request.pat,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "url": request.webhook_url,
+        "merge_requests_events": True,
+        "push_events": False,
+        "enable_ssl_verification": False,
+        "token": settings.gitlab_webhook_token
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code not in (200, 201):
+            logger.error("Failed to setup webhook: %s", resp.text)
+            raise HTTPException(status_code=500, detail=f"Failed to setup webhook: {resp.text}")
+            
+    return {"status": "ok", "message": "Webhook configured successfully"}
+
+
+@app.get("/api/simulations", tags=["dashboard"])
+async def get_simulations(limit: int = 20, skip: int = 0):
+    """List recent simulations."""
+    docs, total = await list_simulations({}, limit, skip)
+    # Convert ObjectIds to strings
+    for doc in docs:
+        doc["_id"] = str(doc["_id"])
+    return {"data": docs, "total": total}
+
+
+@app.get("/api/simulation/{simulation_id}", tags=["dashboard"])
+async def api_get_simulation(simulation_id: str):
+    """Get single simulation state."""
+    doc = await get_simulation(simulation_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+
+@app.get("/api/simulation/{simulation_id}/stream", tags=["dashboard"])
+async def stream_simulation(simulation_id: str, request: Request):
+    """Stream simulation state changes using Server-Sent Events."""
+    async def event_publisher():
+        last_status = None
+        while True:
+            if await request.is_disconnected():
+                break
+                
+            doc = await get_simulation(simulation_id)
+            if not doc:
+                yield dict(event="error", data=json.dumps({"error": "not found"}))
+                break
+                
+            # JSON serialization fix
+            doc["_id"] = str(doc["_id"])
+            if "created_at" in doc and hasattr(doc["created_at"], "isoformat"):
+                doc["created_at"] = doc["created_at"].isoformat()
+            if "completed_at" in doc and hasattr(doc["completed_at"], "isoformat"):
+                doc["completed_at"] = doc["completed_at"].isoformat()
+                
+            status = doc.get("status")
+            yield dict(event="message", data=json.dumps(doc))
+            
+            if status in ["completed", "error", "cancelled"]:
+                break
+                
+            last_status = status
+            await asyncio.sleep(1)
+            
+    return EventSourceResponse(event_publisher())
 
 
 @app.post(
