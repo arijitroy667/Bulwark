@@ -21,7 +21,8 @@ export default function SimulationLiveView({ params }: { params: Promise<{ id: s
   const [error, setError] = useState<string>('');
 
   useEffect(() => {
-    const eventSource = new EventSource(`http://localhost:8000/api/simulation/${id}/stream`);
+    const apiUrl = 'https://bulwark-orchestrator-65585602423.us-central1.run.app';
+    const eventSource = new EventSource(`${apiUrl}/api/simulation/${id}/stream`);
 
     eventSource.addEventListener('message', (e) => {
       try {

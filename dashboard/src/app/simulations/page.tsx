@@ -9,7 +9,8 @@ export default function SimulationsPage() {
   const router = useRouter();
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/simulations')
+    const apiUrl = 'https://bulwark-orchestrator-65585602423.us-central1.run.app';
+    fetch(`${apiUrl}/api/simulations`)
       .then(res => res.json())
       .then(data => {
         setSimulations(data.data || []);

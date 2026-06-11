@@ -17,7 +17,8 @@ export default function SetupPage() {
     setError('');
 
     try {
-      const res = await fetch('http://localhost:8000/api/setup', {
+      const apiUrl = 'https://bulwark-orchestrator-65585602423.us-central1.run.app';
+      const res = await fetch(`${apiUrl}/api/setup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
