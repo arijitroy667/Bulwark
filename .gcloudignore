@@ -1,0 +1,4 @@
+.next/
+dashboard/.next/
+node_modules/
+.git/
