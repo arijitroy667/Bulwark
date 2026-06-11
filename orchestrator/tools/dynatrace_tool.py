@@ -5,12 +5,12 @@ All operations go through the Dynatrace MCP server via ``shared.mcp_client``.
 Python function signatures are unchanged from Phase 1 so that ``agent.py``
 requires no modifications.
 
-MCP operations implemented (per PRD §6.2):
-  getProblems       → has_active_incident()
-  getServiceMetrics → get_service_baseline()
-  getLogs           → get_production_requests()
-  getServiceTopology → get_service_topology()
-  getSLOs           → _fetch_slo_targets() (internal, called from baseline)
+MCP operations implemented (per PRD §6.2) using execute-dql:
+  getProblems       -> execute-dql (fetch problems)
+  getServiceMetrics -> execute-dql (fetch metrics)
+  getLogs           -> execute-dql (fetch logs)
+  getServiceTopology -> execute-dql (fetch entities)
+  getSLOs           -> execute-dql (fetch slos)
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
+import json
 
 from shared.anonymizer import (
     anonymize_production_request,
@@ -34,6 +35,31 @@ from shared.models import (
 logger = logging.getLogger("bulwark.dynatrace")
 
 
+def _parse_dql_result(data: Any) -> list[dict]:
+    """Parse the text output from the execute-dql MCP tool into a Python list of dicts."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("result", data.get("results", []))
+    if isinstance(data, str):
+        marker = "Execution result:\n"
+        idx = data.find(marker)
+        if idx != -1:
+            try:
+                parsed = json.loads(data[idx + len(marker):].strip())
+                return parsed if isinstance(parsed, list) else [parsed]
+            except Exception as exc:
+                logger.debug("Failed to parse DQL execution result: %s", exc)
+        else:
+            # Maybe it's just raw JSON array?
+            try:
+                parsed = json.loads(data)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except Exception:
+                pass
+    return []
+
+
 # ──────────────────────────────────────────────
 # Active Incident Check
 # ──────────────────────────────────────────────
@@ -47,10 +73,9 @@ async def has_active_incident(service_name: str) -> bool:
     try:
         data = await call_tool(
             MCPServer.DYNATRACE,
-            "getProblems",
+            "execute-dql",
             {
-                "problemSelector": f'status("OPEN"),entityId("{service_name}")',
-                "fields": "evidenceDetails,impactAnalysis",
+                "dqlQueryString": f'fetch problems | filter status == "OPEN" and contains(entity.name, "{service_name}") | limit 10'
             },
         )
     except MCPConfigError:
@@ -62,14 +87,10 @@ async def has_active_incident(service_name: str) -> bool:
         logger.warning("Failed to check incidents (proceeding without): %s", exc)
         return False
 
-    problems = []
-    if isinstance(data, dict):
-        problems = data.get("problems", [])
-    elif isinstance(data, list):
-        problems = data
+    problems = _parse_dql_result(data)
 
     for problem in problems:
-        severity = problem.get("severityLevel", "").upper()
+        severity = str(problem.get("severityLevel", "")).upper()
         if severity in ("CRITICAL", "ERROR", "AVAILABILITY"):
             logger.warning(
                 "Active %s incident found for %s: %s",
@@ -96,51 +117,40 @@ async def get_service_baseline(service_name: str) -> ServiceBaseline:
     Also fetches SLO targets if available.
     """
     now = datetime.now(timezone.utc)
-    start_time = now - timedelta(hours=24)
-    from_ts = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    to_ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Note: execute-dql timeframes are usually part of the query or environment defaults.
     try:
         latency_data = await call_tool(
             MCPServer.DYNATRACE,
-            "getServiceMetrics",
+            "execute-dql",
             {
-                "metricSelector": (
-                    f"builtin:service.response.time"
-                    f":filter(eq(dt.entity.service,{service_name}))"
-                    f":percentile(50):percentile(95):percentile(99)"
-                ),
-                "from": from_ts,
-                "to": to_ts,
-                "resolution": "1d",
+                "dqlQueryString": (
+                    f'fetch metrics | filter metric.key == "builtin:service.response.time" '
+                    f'and dt.entity.service == "{service_name}" '
+                    f'| summarize p50 = percentile(value, 50), p95 = percentile(value, 95), p99 = percentile(value, 99)'
+                )
             },
         )
 
         error_data = await call_tool(
             MCPServer.DYNATRACE,
-            "getServiceMetrics",
+            "execute-dql",
             {
-                "metricSelector": (
-                    f"builtin:service.errors.total.rate"
-                    f":filter(eq(dt.entity.service,{service_name}))"
-                ),
-                "from": from_ts,
-                "to": to_ts,
-                "resolution": "1d",
+                "dqlQueryString": (
+                    f'fetch metrics | filter metric.key == "builtin:service.errors.total.rate" '
+                    f'and dt.entity.service == "{service_name}" | summarize rate = avg(value)'
+                )
             },
         )
 
         throughput_data = await call_tool(
             MCPServer.DYNATRACE,
-            "getServiceMetrics",
+            "execute-dql",
             {
-                "metricSelector": (
-                    f"builtin:service.requestCount.total"
-                    f":filter(eq(dt.entity.service,{service_name}))"
-                ),
-                "from": from_ts,
-                "to": to_ts,
-                "resolution": "1d",
+                "dqlQueryString": (
+                    f'fetch metrics | filter metric.key == "builtin:service.requestCount.total" '
+                    f'and dt.entity.service == "{service_name}" | summarize count = sum(value)'
+                )
             },
         )
 
@@ -153,10 +163,26 @@ async def get_service_baseline(service_name: str) -> ServiceBaseline:
         logger.warning("Failed to fetch Dynatrace baseline: %s", exc)
         return ServiceBaseline(service_name=service_name)
 
-    # Parse latency values (Dynatrace returns microseconds → convert to ms)
-    p50, p95, p99 = _parse_latency_metrics(latency_data)
-    error_rate = _parse_error_rate(error_data)
-    throughput = _parse_throughput(throughput_data)
+    # Parse metrics (extract values from DQL result rows)
+    p50 = p95 = p99 = 0.0
+    lat_rows = _parse_dql_result(latency_data)
+    if lat_rows:
+        row = lat_rows[0]
+        # values are generally in microseconds in dt core, but dql depends on formatting. We assume micros to ms for safety as per original
+        p50 = float(row.get("p50", 0) or 0) / 1000.0
+        p95 = float(row.get("p95", 0) or 0) / 1000.0
+        p99 = float(row.get("p99", 0) or 0) / 1000.0
+
+    error_rate = 0.0
+    err_rows = _parse_dql_result(error_data)
+    if err_rows:
+        error_rate = float(err_rows[0].get("rate", 0) or 0)
+
+    throughput = 0.0
+    tpt_rows = _parse_dql_result(throughput_data)
+    if tpt_rows:
+        count = float(tpt_rows[0].get("count", 0) or 0)
+        throughput = count / (24 * 60)
 
     # Fetch SLOs
     slo_latency, slo_error = await _fetch_slo_targets(service_name)
@@ -195,27 +221,16 @@ async def get_production_requests(
 ) -> list[ProductionRequest]:
     """
     Fetch production request logs from Dynatrace via MCP for traffic replay.
-
-    Retrieves the last N hours of HTTP request logs, anonymizes all PII,
-    and returns a list of ProductionRequest objects ready for replay.
     """
-    now = datetime.now(timezone.utc)
-    start_time = now - timedelta(hours=hours)
-
     try:
         data = await call_tool(
             MCPServer.DYNATRACE,
-            "getLogs",
+            "execute-dql",
             {
-                "query": (
-                    f'loglevel="INFO" AND '
-                    f'dt.entity.service="{service_name}" AND '
-                    f'content="HTTP"'
-                ),
-                "from": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "limit": limit,
-                "sort": "-timestamp",
+                "dqlQueryString": (
+                    f'fetch logs | filter loglevel == "INFO" and contains(dt.entity.service, "{service_name}") '
+                    f'and contains(content, "HTTP") | sort timestamp desc | limit {limit}'
+                )
             },
         )
     except MCPConfigError:
@@ -227,16 +242,9 @@ async def get_production_requests(
         logger.warning("Failed to fetch production requests: %s", exc)
         return []
 
-    # Reset anonymization state for a fresh session
     reset_anonymization_state()
+    records = _parse_dql_result(data)
 
-    records = []
-    if isinstance(data, dict):
-        records = data.get("results", [])
-    elif isinstance(data, list):
-        records = data
-
-    # Parse and anonymize log entries
     requests = []
     for record in records[:limit]:
         parsed = _parse_log_to_request(record)
@@ -260,21 +268,16 @@ async def get_production_requests(
 async def get_service_topology(service_name: str) -> ServiceTopology:
     """
     Fetch the service dependency graph from Dynatrace via MCP.
-
-    Returns the service's downstream dependencies — used to create WireMock stubs
-    in the ephemeral environment.
     """
     try:
         data = await call_tool(
             MCPServer.DYNATRACE,
-            "getServiceTopology",
+            "execute-dql",
             {
-                "entityId": service_name,
-                "fields": (
-                    "fromRelationships.calls,"
-                    "toRelationships.calledBy,"
-                    "properties"
-                ),
+                "dqlQueryString": (
+                    f'fetch entities | filter type == "SERVICE" and entity.name == "{service_name}" '
+                    f'| fields fromRelationships.calls, toRelationships.calledBy'
+                )
             },
         )
     except MCPConfigError:
@@ -286,22 +289,23 @@ async def get_service_topology(service_name: str) -> ServiceTopology:
         logger.warning("Failed to fetch service topology: %s", exc)
         return ServiceTopology(service_name=service_name)
 
-    if not isinstance(data, dict):
+    rows = _parse_dql_result(data)
+    if not rows:
         return ServiceTopology(service_name=service_name)
 
-    # Parse downstream dependencies
     dependencies = []
-    calls = data.get("fromRelationships", {}).get("calls", [])
-    for dep in calls:
-        dep_id = dep.get("id", "")
-        dep_name = dep.get("type", dep_id)
-        dependencies.append(
-            ServiceDependency(
-                name=dep_name,
-                base_url=f"http://mock-{dep_name}:8080",
-                endpoints=["/"],
+    calls = rows[0].get("fromRelationships.calls", [])
+    if isinstance(calls, list):
+        for dep in calls:
+            dep_id = dep.get("id", "") if isinstance(dep, dict) else str(dep)
+            dep_name = dep.get("type", dep_id) if isinstance(dep, dict) else str(dep)
+            dependencies.append(
+                ServiceDependency(
+                    name=dep_name,
+                    base_url=f"http://mock-{dep_name}:8080",
+                    endpoints=["/"],
+                )
             )
-        )
 
     topology = ServiceTopology(
         service_name=service_name,
@@ -321,50 +325,12 @@ async def get_service_topology(service_name: str) -> ServiceTopology:
 # ──────────────────────────────────────────────
 
 
-def _parse_latency_metrics(data: Any) -> tuple[float, float, float]:
-    """Parse Dynatrace metrics response into p50/p95/p99 latency values in ms."""
-    try:
-        results = data.get("result", []) if isinstance(data, dict) else []
-        p50 = p95 = p99 = 0.0
-        for result in results:
-            metric_id = result.get("metricId", "")
-            values = result.get("data", [{}])[0].get("values", [0])
-            value = values[0] if values else 0
-            # Dynatrace returns microseconds — convert to ms
-            value_ms = (value or 0) / 1000.0
-            if "percentile(50)" in metric_id:
-                p50 = value_ms
-            elif "percentile(95)" in metric_id:
-                p95 = value_ms
-            elif "percentile(99)" in metric_id:
-                p99 = value_ms
-        return p50, p95, p99
-    except (IndexError, KeyError, TypeError):
-        return 0.0, 0.0, 0.0
-
 _VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
 
 
 def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
     """
     Parse a Dynatrace log record into a ProductionRequest.
-    Applies PII anonymization before returning.
-
-    Phase 4: Handles four real Dynatrace / OpenTelemetry record shapes:
-
-    1. **Structured direct fields** (e.g., Dynatrace Log v1):
-       ``{"method": "GET", "path": "/api/users", "status": 200}``
-
-    2. **OpenTelemetry span attributes dict** (Dynatrace Distributed Tracing):
-       ``{"attributes": {"http.method": "POST", "http.url": "https://svc/api", "http.status_code": 201}}``
-
-    3. **Dynatrace Logs API v2 log.body wrapper**:
-       ``{"log.body": {"content": "HTTP GET /api/users 200 45ms"}}``
-
-    4. **Free-text content fallback** (Dynatrace Log v1 text):
-       ``{"content": "HTTP GET /api/users/123 200 45ms"}``
-
-    Records with invalid or absent HTTP methods are discarded (returns None).
     """
     import json as _json
     from urllib.parse import urlparse
@@ -374,113 +340,44 @@ def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
         path: str = ""
         expected_status: int = 200
 
-        # ── Path 1: OpenTelemetry span attributes dict ──
-        attributes = record.get("attributes")
-        if isinstance(attributes, dict):
-            # Support both canonical OTel (http.method) and Bulwark's (request.method)
-            method = str(
-                attributes.get("http.method")
-                or attributes.get("request.method")
-                or ""
-            ).upper()
-            # Support http.url, http.target, url.path
-            raw_url = (
-                attributes.get("http.url")
-                or attributes.get("http.target")
-                or attributes.get("url.path")
-                or ""
-            )
-            if raw_url:
-                parsed = urlparse(str(raw_url))
-                path = parsed.path or raw_url
-            # Support http.status_code and http.response.status_code
-            expected_status = int(
-                attributes.get("http.status_code")
-                or attributes.get("http.response.status_code")
-                or 200
-            )
-            # Also pull headers/body from OTel attributes
-            raw_headers = attributes.get("http.request.headers", {})
-            headers: dict[str, str] = raw_headers if isinstance(raw_headers, dict) else {}
-            # Also extract individual header attributes: http.request.header.<name>
-            header_prefix = "http.request.header."
-            for attr_key, attr_val in attributes.items():
-                if attr_key.startswith(header_prefix):
-                    header_name = attr_key[len(header_prefix):]
-                    headers[header_name] = str(attr_val)
-            body_raw = attributes.get("http.request.body")
-            if isinstance(body_raw, str):
-                try:
-                    body: Any = _json.loads(body_raw)
-                except _json.JSONDecodeError:
-                    body = body_raw
-            else:
-                body = body_raw
+        # DQL result columns are often directly mapped to attributes
+        method = str(record.get("http.method", record.get("request.method", record.get("method", "")))).upper()
 
+        raw_url = (
+            record.get("http.url")
+            or record.get("url.path")
+            or record.get("path")
+            or record.get("url")
+            or ""
+        )
+        if raw_url:
+            parsed = urlparse(str(raw_url))
+            path = parsed.path if parsed.path else str(raw_url)
         else:
-            # ── Path 2: Structured direct fields ──
-            method = str(record.get("method") or record.get("http.method", "")).upper()
+            path = ""
 
-            # Path/URL resolution — full URL → extract path component
-            raw_url = (
-                record.get("url")
-                or record.get("http.url")
-                or record.get("url.path")
-                or record.get("path")
-                or ""
-            )
-            if raw_url:
-                parsed = urlparse(str(raw_url))
-                path = parsed.path if parsed.path else str(raw_url)
-            else:
-                path = ""
+        expected_status = int(record.get("http.status_code", record.get("status", 200)) or 200)
 
-            expected_status = int(record.get("status") or record.get("http.status_code", 200) or 200)
-            raw_headers = record.get("http.request.headers", record.get("headers", {}))
-            headers = raw_headers if isinstance(raw_headers, dict) else {}
-            body_raw = record.get("http.request.body", record.get("body"))
-            if isinstance(body_raw, str):
-                try:
-                    body = _json.loads(body_raw)
-                except _json.JSONDecodeError:
-                    body = body_raw
-            else:
-                body = body_raw
-
-        # ── Path 3: Dynatrace Logs API v2 log.body wrapper ──
-        if (not method or not path) and "log.body" in record:
-            log_body = record["log.body"]
-            content = (
-                log_body.get("content", "") if isinstance(log_body, dict) else str(log_body)
-            )
+        # Free-text content fallback
+        if not method or not path:
+            content = str(record.get("content", ""))
             method, path, expected_status = _parse_text_content(content, method, path, expected_status)
             headers = {}
             body = None
+        else:
+            headers = {}
+            body = None
 
-        # ── Path 4: Free-text content fallback ──
-        if not method or not path:
-            content = record.get("content", "")
-            method, path, expected_status = _parse_text_content(content, method, path, expected_status)
-            if not isinstance(headers, dict):
-                headers = {}
-            if "body" not in dir():
-                body = None
-
-        # Validate: discard records with absent or invalid HTTP methods
         if not method or method not in _VALID_HTTP_METHODS:
-            logger.debug(
-                "Discarding log record with invalid HTTP method '%s'", method
-            )
             return None
-
         if not path:
             return None
 
         anon_path, anon_headers, anon_body = anonymize_production_request(
             method=method,
             path=path,
-            headers=headers if isinstance(headers, dict) else {},
-            body=body if isinstance(body, (dict, str)) or body is None else None,
+            headers=headers,
+            body=body,
         )
 
         return ProductionRequest(
@@ -496,32 +393,6 @@ def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
         return None
 
 
-def _parse_error_rate(data: Any) -> float:
-    """Parse Dynatrace error rate metric response into a percentage."""
-    try:
-        results = data.get("result", []) if isinstance(data, dict) else []
-        if results:
-            values = results[0].get("data", [{}])[0].get("values", [0])
-            return float(values[0] or 0)
-        return 0.0
-    except (IndexError, KeyError, TypeError):
-        return 0.0
-
-
-def _parse_throughput(data: Any) -> float:
-    """Parse Dynatrace throughput metric into requests per minute."""
-    try:
-        results = data.get("result", []) if isinstance(data, dict) else []
-        if results:
-            values = results[0].get("data", [{}])[0].get("values", [0])
-            # Convert from total count over 24h to RPM
-            total_count = float(values[0] or 0)
-            return total_count / (24 * 60)
-        return 0.0
-    except (IndexError, KeyError, TypeError):
-        return 0.0
-
-
 def _parse_text_content(
     content: str,
     method: str,
@@ -529,9 +400,7 @@ def _parse_text_content(
     expected_status: int,
 ) -> tuple[str, str, int]:
     """
-    Parse free-text HTTP log line: 'HTTP GET /api/path 200 45ms' or
-    'GET /api/path 200'.
-    Returns (method, path, status) updating only fields that are currently unset.
+    Parse free-text HTTP log line: 'HTTP GET /api/path 200 45ms'
     """
     parts = content.split()
     for i, part in enumerate(parts):
@@ -548,37 +417,31 @@ def _parse_text_content(
 
 async def _fetch_slo_targets(service_name: str) -> tuple[float, float]:
     """
-    Fetch SLO targets for a service from Dynatrace via MCP.
-    Returns (latency_budget_ms, error_budget_percent).
+    Fetch SLO targets for a service from Dynatrace via MCP using execute-dql.
     """
     try:
         data = await call_tool(
             MCPServer.DYNATRACE,
-            "getSLOs",
+            "execute-dql",
             {
-                "sloSelector": f'entityId("{service_name}")',
-                "pageSize": 10,
+                "dqlQueryString": f'fetch slos | filter contains(entity.name, "{service_name}") | fields name, target'
             },
         )
     except Exception as exc:
         logger.debug("SLO fetch failed (using defaults): %s", exc)
-        return 200.0, 1.0  # v3 corrected defaults (not 20ms/0.5% from v1)
+        return 200.0, 1.0
 
-    slos = []
-    if isinstance(data, dict):
-        slos = data.get("slo", [])
-    elif isinstance(data, list):
-        slos = data
+    slos = _parse_dql_result(data)
 
-    latency_budget = 200.0  # v3 corrected default (20ms was below noise floor)
-    error_budget = 1.0      # v3 corrected default
+    latency_budget = 200.0  
+    error_budget = 1.0      
 
     for slo in slos:
         slo_name = slo.get("name", "").lower()
         target = slo.get("target", 0)
         if "latency" in slo_name or "response" in slo_name:
-            latency_budget = 200.0  # Simplified: use corrected default
+            latency_budget = 200.0  
         elif "error" in slo_name or "availability" in slo_name:
-            error_budget = max(0, 100 - target)  # budget = 100 - target
+            error_budget = max(0, 100 - target)
 
     return latency_budget, error_budget

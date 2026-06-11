@@ -31,11 +31,18 @@ class BulwarkSettings(BaseSettings):
 
     # --- Dynatrace ---
     dynatrace_env_id: str = ""
-    dynatrace_api_token: str = ""
+
+    # --- Dynatrace OAuth2 (for MCP Gateway token fetch) ---
+    # Maps to CLIENT-ID / CLIENT-SECRET / CLIENT_URL in .env
+    # pydantic-settings normalises hyphens → underscores automatically.
+    client_id: str = ""           # dt0s02.XXXXXXXX
+    client_secret: str = ""       # dt0s02.XXXXXXXX.XXXX…
+    client_url: str = ""          # urn:dtaccount:<uuid>
 
     # --- Arize (Phase 2) ---
     arize_api_key: str = ""
     arize_space_id: str = ""  # Arize space ID (not "space_key" — matches Arize MCP param name)
+    phoenix_collector_endpoint: str = "https://app.phoenix.arize.com"
 
     # --- MongoDB ---
     mongodb_uri: str = "mongodb://localhost:27017"
@@ -90,6 +97,27 @@ class BulwarkSettings(BaseSettings):
     def dynatrace_base_url(self) -> str:
         """Construct the Dynatrace API base URL from the environment ID."""
         return f"https://{self.dynatrace_env_id}.live.dynatrace.com/api/v2"
+
+    @property
+    def dynatrace_mcp_gateway_url(self) -> str:
+        """
+        Return the real Dynatrace MCP Gateway URL.
+
+        Format: https://{env-name}.apps.dynatrace.com/platform-reserved/
+                mcp-gateway/v0.1/servers/dynatrace-mcp/mcp
+
+        If ``dynatrace_mcp_url`` is already set explicitly in the environment
+        (e.g. pointing at a custom deployment) that value is returned as-is.
+        Otherwise the URL is derived from ``dynatrace_env_id``.
+        """
+        if self.dynatrace_mcp_url.strip():
+            return self.dynatrace_mcp_url.strip()
+        if self.dynatrace_env_id:
+            return (
+                f"https://{self.dynatrace_env_id}.apps.dynatrace.com"
+                "/platform-reserved/mcp-gateway/v0.1/servers/dynatrace-mcp/mcp"
+            )
+        return ""
 
     @property
     def gitlab_api_url(self) -> str:

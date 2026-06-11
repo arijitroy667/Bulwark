@@ -1,0 +1,669 @@
+[
+  {
+    "name": "list-prompts",
+    "description": "Get a list of all the prompts.\n\nPrompts (templates, prompt templates) are versioned templates for input messages to an LLM.\nEach prompt includes both the input messages, but also the model and invocation parameters\nto use when generating outputs.\n\nReturns a list of prompt objects with their IDs, names, and descriptions.\n\nExample usage:\n  List all available prompts\n\nExpected return:\n  Array of prompt objects with metadata.\n  Example:  [{\n      \"name\": \"article-summarizer\",\n      \"description\": \"Summarizes an article into concise bullet points\",\n      \"source_prompt_id\": null,\n      \"id\": \"promptid1234\"\n  }]",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    }
+  },
+  {
+    "name": "get-prompt",
+    "description": "Get a prompt using a single MCP-native interface.\n\nProvide a prompt identifier to fetch the latest version, or add a tag or versionId to select a specific version.\n\nExample usage:\n  Get prompt \"article-summarizer\"\n  Get prompt \"article-summarizer\" with tag \"production\"\n  Get prompt \"article-summarizer\" using version \"promptversionid1234\"\n\nExpected return:\n  Prompt version object with template and configuration.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_identifier": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_identifier"
+      ]
+    }
+  },
+  {
+    "name": "get-latest-prompt",
+    "description": "Get the latest version of a prompt. Returns the prompt version with its template, model configuration, and invocation parameters.\n\nExample usage:\n  Get the latest version of a prompt named 'article-summarizer'\n\nExpected return:\n  Prompt version object with template and configuration.\n  Example: {\n    \"description\": \"Initial version\",\n    \"model_provider\": \"OPENAI\",\n    \"model_name\": \"gpt-3.5-turbo\",\n    \"template\": {\n      \"type\": \"chat\",\n      \"messages\": [\n        {\n          \"role\": \"system\",\n          \"content\": \"You are an expert summarizer. Create clear, concise bullet points highlighting the key information.\"\n        },\n        {\n          \"role\": \"user\",\n          \"content\": \"Please summarize the following {{topic}} article:\\n\\n{{article}}\"\n        }\n      ]\n    },\n    \"template_type\": \"CHAT\",\n    \"template_format\": \"MUSTACHE\",\n    \"invocation_parameters\": {\n      \"type\": \"openai\",\n      \"openai\": {}\n    },\n    \"id\": \"promptversionid1234\"\n  }",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_identifier": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_identifier"
+      ]
+    }
+  },
+  {
+    "name": "get-prompt-by-identifier",
+    "description": "Get a prompt's latest version by its identifier (name or ID). Returns the prompt version with its template, model configuration, and invocation parameters.\n\nExample usage:\n  Get the latest version of a prompt with name 'article-summarizer'\n\nExpected return:\n  Prompt version object with template and configuration.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_identifier": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_identifier"
+      ]
+    }
+  },
+  {
+    "name": "get-prompt-version",
+    "description": "Get a specific version of a prompt using its version ID. Returns the prompt version with its template, model configuration, and invocation parameters.\n\nExample usage:\n  Get a specific prompt version with ID 'promptversionid1234'\n\nExpected return:\n  Prompt version object with template and configuration.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_version_id"
+      ]
+    }
+  },
+  {
+    "name": "upsert-prompt",
+    "description": "Create or update a prompt with its template and configuration. Creates a new prompt and its initial version with specified model settings.\n\nExample usage:\n  Create a new prompt named 'email_generator' with a template for generating emails\n\nExpected return:\n  A confirmation message of successful prompt creation",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "template": {
+          "type": "string"
+        },
+        "model_provider": {
+          "default": "OPENAI",
+          "type": "string",
+          "enum": [
+            "OPENAI",
+            "AZURE_OPENAI",
+            "ANTHROPIC",
+            "GOOGLE"
+          ]
+        },
+        "model_name": {
+          "default": "gpt-4",
+          "type": "string"
+        },
+        "temperature": {
+          "default": 0.7,
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "template"
+      ]
+    }
+  },
+  {
+    "name": "list-prompt-versions",
+    "description": "Get a list of all versions for a specific prompt. Returns versions with pagination support.\n\nExample usage:\n  List all versions of a prompt named 'article-summarizer'\n\nExpected return:\n  Array of prompt version objects with IDs and configuration.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_identifier": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "prompt_identifier"
+      ]
+    }
+  },
+  {
+    "name": "get-prompt-version-by-tag",
+    "description": "Get a prompt version by its tag name. Returns the prompt version with its template, model configuration, and invocation parameters.\n\nExample usage:\n  Get the 'production' tagged version of prompt 'article-summarizer'\n\nExpected return:\n  Prompt version object with template and configuration.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_identifier": {
+          "type": "string"
+        },
+        "tag_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_identifier",
+        "tag_name"
+      ]
+    }
+  },
+  {
+    "name": "list-prompt-version-tags",
+    "description": "Get a list of all tags for a specific prompt version. Returns tag objects with pagination support.\n\nExample usage:\n  List all tags associated with prompt version 'promptversionid1234'\n\nExpected return:\n  Array of tag objects with names and IDs.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_version_id": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "prompt_version_id"
+      ]
+    }
+  },
+  {
+    "name": "add-prompt-version-tag",
+    "description": "Add a tag to a specific prompt version. The operation returns no content on success (204 status code).\n\nExample usage:\n  Tag prompt version 'promptversionid1234' with the name 'production'\n\nExpected return:\n  Confirmation message of successful tag addition",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "prompt_version_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_version_id",
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "list-experiments-for-dataset",
+    "description": "Get a list of all the experiments run on a given dataset.\n\nExperiments are collections of experiment runs, each experiment run corresponds to a single\ndataset example. The dataset example is passed to an implied `task` which in turn\nproduces an output.\n\nExample usage:\n  Show me all the experiments I've run on dataset RGF0YXNldDox\n\nExpected return:\n  Array of experiment objects with metadata.\n  Example: [\n    {\n      \"id\": \"experimentid1234\",\n      \"dataset_id\": \"datasetid1234\",\n      \"dataset_version_id\": \"datasetversionid1234\",\n      \"repetitions\": 1,\n      \"metadata\": {},\n      \"project_name\": \"Experiment-abc123\",\n      \"created_at\": \"YYYY-MM-DDTHH:mm:ssZ\",\n      \"updated_at\": \"YYYY-MM-DDTHH:mm:ssZ\"\n    }\n  ]",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_name": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "get-experiment-by-id",
+    "description": "Get an experiment by its ID.\n\nThe tool returns experiment metadata in the first content block and a JSON object with the\nexperiment data in the second. The experiment data contains both the results of each\nexperiment run and the annotations made by an evaluator to score or label the results,\nfor example, comparing the output of an experiment run to the expected output from the\ndataset example.\n\nExample usage:\n  Show me the experiment results for experiment RXhwZXJpbWVudDo4\n\nExpected return:\n  Object containing experiment metadata and results.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "experiment_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "experiment_id"
+      ]
+    }
+  },
+  {
+    "name": "list-datasets",
+    "description": "Get a list of all datasets.\n\nDatasets are collections of 'dataset examples' that each example includes an input,\n(expected) output, and optional metadata. They are primarily used as inputs for experiments.\n\nExample usage:\n  Show me all available datasets\n\nExpected return:\n  Array of dataset objects with metadata.\n  Example: [\n    {\n      \"id\": \"RGF0YXNldDox\",\n      \"name\": \"my-dataset\",\n      \"description\": \"A dataset for testing\",\n      \"metadata\": {},\n      \"created_at\": \"2024-03-20T12:00:00Z\",\n      \"updated_at\": \"2024-03-20T12:00:00Z\"\n    }\n  ]",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "get-dataset",
+    "description": "Get dataset metadata by name or ID.\n\nExample usage:\n  Show me the dataset \"my-dataset\"\n\nExpected return:\n  A dataset object with metadata and version information.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_name": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "get-dataset-examples",
+    "description": "Get examples from a dataset.\n\nDataset examples are an array of objects that each include an input,\n(expected) output, and optional metadata. These examples are typically used to represent\ninput to an application or model (e.g. prompt template variables, a code file, or image)\nand used to test or benchmark changes.\n\nExample usage:\n  Show me all examples from dataset RGF0YXNldDox\n\nExpected return:\n  Object containing dataset ID, version ID, and array of examples.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_name": {
+          "type": "string"
+        },
+        "version_id": {
+          "type": "string"
+        },
+        "splits": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "get-dataset-experiments",
+    "description": "List experiments run on a dataset.\n\nExample usage:\n  Show me all experiments run on dataset RGF0YXNldDox\n\nExpected return:\n  Array of experiment objects with metadata.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "dataset_name": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "add-dataset-examples",
+    "description": "Add examples to an existing dataset.\n\nThis tool adds one or more examples to an existing dataset. Each example includes an input,\noutput, and metadata. The metadata will automatically include information indicating that\nthese examples were synthetically generated via MCP. When calling this tool, check existing\nexamples using the \"get-dataset-examples\" tool to ensure that you are not adding duplicate\nexamples and following existing patterns for how data should be structured.\n\nExample usage:\n  Look at the analyze \"my-dataset\" and augment them with new examples to cover relevant edge cases\n\nExpected return:\n  Confirmation of successful addition of examples to the dataset.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "dataset_name": {
+          "type": "string"
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              "output": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              "metadata": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            },
+            "required": [
+              "input",
+              "output"
+            ]
+          }
+        }
+      },
+      "required": [
+        "dataset_name",
+        "examples"
+      ]
+    }
+  },
+  {
+    "name": "list-projects",
+    "description": "Get a list of all projects.\n\nProjects are containers for organizing traces, spans, and other observability data.\nEach project has a unique name and can contain traces from different applications or experiments.\n\nExample usage:\n  Show me all available projects\n\nExpected return:\n  Array of project objects with metadata.\n  Example: [\n    {\n      \"id\": \"UHJvamVjdDox\",\n      \"name\": \"default\",\n      \"description\": \"Default project for traces\"\n    },\n    {\n      \"id\": \"UHJvamVjdDoy\",\n      \"name\": \"my-experiment\",\n      \"description\": \"Project for my ML experiment\"\n    }\n  ]",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "include_experiment_projects": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "get-project",
+    "description": "Get a project by name or ID.\n\nExample usage:\n  Show me the project \"default\"\n\nExpected return:\n  A single project object with metadata.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_identifier"
+      ]
+    }
+  },
+  {
+    "name": "list-traces",
+    "description": "List traces for a project.\n\nThis tool groups project spans into traces and returns the newest traces first.\n\nExample usage:\n  Show me the last 10 traces for project \"default\"\n  Show me recent traces from the last 30 minutes for project \"checkout\"\n\nExpected return:\n  Array of trace objects with grouped spans and summary timing information.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 10,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "since": {
+          "type": "string"
+        },
+        "last_n_minutes": {
+          "type": "number",
+          "minimum": 1
+        },
+        "include_annotations": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "get-trace",
+    "description": "Get a single trace by its exact trace ID within a project.\n\nExample usage:\n  Show me trace \"abc123def456\" from project \"default\"\n\nExpected return:\n  A trace object with all spans that belong to the trace.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        },
+        "trace_id": {
+          "type": "string"
+        },
+        "include_annotations": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "trace_id"
+      ]
+    }
+  },
+  {
+    "name": "get-spans",
+    "description": "Get spans from a project with filtering criteria.\n\nSpans represent individual operations or units of work within a trace. They contain timing information,\nattributes, and context about the operation being performed.\n\nExample usage:\n  Get recent spans from project \"my-project\"\n  Get spans in a time range from project \"my-project\"\n\nExpected return:\n  Object containing spans array and optional next cursor for pagination.\n  Example: {\n    \"spans\": [\n      {\n        \"id\": \"span123\",\n        \"name\": \"http_request\",\n        \"context\": {\n          \"trace_id\": \"trace456\",\n          \"span_id\": \"span123\"\n        },\n        \"start_time\": \"2024-01-01T12:00:00Z\",\n        \"end_time\": \"2024-01-01T12:00:01Z\",\n        \"attributes\": {\n          \"http.method\": \"GET\",\n          \"http.url\": \"/api/users\"\n        }\n      }\n    ],\n    \"nextCursor\": \"cursor_for_pagination\"\n  }",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        },
+        "start_time": {
+          "type": "string"
+        },
+        "end_time": {
+          "type": "string"
+        },
+        "trace_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "span_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "OK",
+              "ERROR",
+              "UNSET"
+            ]
+          }
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "include_annotations": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "get-span-annotations",
+    "description": "Get span annotations for a list of span IDs.\n\nSpan annotations provide additional metadata, scores, or labels for spans. They can be created\nby humans, LLMs, or code and help in analyzing and categorizing spans.\n\nExample usage:\n  Get annotations for spans [\"span1\", \"span2\"] from project \"my-project\"\n  Get quality score annotations for span \"span1\" from project \"my-project\"\n\nExpected return:\n  Object containing annotations array and optional next cursor for pagination.\n  Example: {\n    \"annotations\": [\n      {\n        \"id\": \"annotation123\",\n        \"span_id\": \"span1\",\n        \"name\": \"quality_score\",\n        \"result\": {\n          \"label\": \"good\",\n          \"score\": 0.95,\n          \"explanation\": null\n        },\n        \"annotator_kind\": \"LLM\",\n        \"metadata\": {\n          \"model\": \"gpt-4\"\n        }\n      }\n    ],\n    \"nextCursor\": \"cursor_for_pagination\"\n  }",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        },
+        "span_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "include_annotation_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude_annotation_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "span_ids"
+      ]
+    }
+  },
+  {
+    "name": "list-sessions",
+    "description": "List sessions for a project.\n\nSessions represent conversation flows grouped across traces.\n\nExample usage:\n  Show me the last 10 sessions for project \"default\"\n\nExpected return:\n  Array of session objects ordered by the requested sort order.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "project_identifier": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 10,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "order": {
+          "default": "desc",
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "get-session",
+    "description": "Get a single session by GlobalID or user-provided session_id.\n\nExample usage:\n  Show me session \"chat-123\"\n\nExpected return:\n  A session object and, optionally, its annotations.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "session_identifier": {
+          "type": "string"
+        },
+        "include_annotations": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_identifier"
+      ]
+    }
+  },
+  {
+    "name": "list-annotation-configs",
+    "description": "List Phoenix annotation configs.\n\nAnnotation configs define the available human or automated labels, scores, and freeform annotation types.\n\nExample usage:\n  Show me all annotation configs\n\nExpected return:\n  Array of annotation config objects.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 100,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "phoenix-support",
+    "description": "Get help with Phoenix and OpenInference.\n\n- Tracing AI applications via OpenInference and OpenTelemetry\n- Phoenix datasets, experiments, and prompt management\n- Phoenix evals and annotations\n\nUse this tool when you need assistance with Phoenix features, troubleshooting,\nor best practices.\n\nExpected return:\n  Expert guidance about how to use and integrate Phoenix",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Your question about Arize Phoenix, OpenInference, or related topics"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  }
+]

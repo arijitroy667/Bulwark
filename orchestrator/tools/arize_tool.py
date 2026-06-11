@@ -5,11 +5,10 @@ All operations go through the Arize MCP server via ``shared.mcp_client``.
 Python function signatures are unchanged from Phase 1 so that ``agent.py``
 requires no modifications.
 
-MCP Operations implemented:
-  getDataset / getSpans  → get_llm_baseline()
-  runEval                → run_eval()
-  compareDatasets        → run_eval() (comparison step)
-  logSpans               → log_spans()
+MCP Operations implemented using @arizeai/phoenix-mcp tools:
+  list-datasets + list-experiments-for-dataset + get-experiment-by-id → get_llm_baseline()
+  add-dataset-examples → run_eval() (simulation output ingestion)
+  add-dataset-examples → log_spans() (simulation output ingestion)
 
 If the Arize MCP server is unavailable or not configured, all functions fail
 gracefully and return a result with skip_reason set (per PRD §16 error handling).
@@ -36,24 +35,19 @@ async def get_llm_baseline(service_name: str) -> dict[str, Any]:
     """
     Fetch the production LLM quality baseline for a service from Arize via MCP.
 
-    Retrieves the most recent production dataset (golden dataset) and
-    computes aggregate hallucination/relevance/groundedness scores.
+    Uses `list-datasets` to find the service dataset, then `list-experiments-for-dataset`
+    to find the latest eval run, and `get-experiment-by-id` to extract scores.
 
     Returns dict with keys: dataset_id, hallucination_score, relevance_score,
     groundedness_score, span_count.
     """
     logger.info("Fetching Arize LLM baseline for service: %s", service_name)
     try:
-        # Get production dataset for this service
+        # 1. Get all datasets
         datasets_result = await call_tool(
             MCPServer.ARIZE,
-            "getDataset",
-            {
-                "modelId": service_name,
-                "environment": "production",
-                "limit": 1,
-                "sort": "-created_at",
-            },
+            "list-datasets",
+            {"limit": 100},
         )
     except MCPConfigError:
         raise
@@ -65,56 +59,91 @@ async def get_llm_baseline(service_name: str) -> dict[str, Any]:
         return {"error": str(exc), "dataset_id": None}
 
     # Normalize datasets result
-    datasets = []
-    if isinstance(datasets_result, list):
-        datasets = datasets_result
-    elif isinstance(datasets_result, dict):
-        datasets = datasets_result.get("data", datasets_result.get("datasets", []))
+    datasets = datasets_result if isinstance(datasets_result, list) else []
+    
+    # Try to find the production dataset for this service
+    target_name = f"bulwark-prod-{service_name}"
+    dataset = next((d for d in datasets if isinstance(d, dict) and (d.get("name") == target_name or service_name in d.get("name", ""))), None)
 
-    if not datasets:
+    if not dataset:
         logger.warning("No production dataset found in Arize for %s", service_name)
         return {"dataset_id": None, "error": "no_production_dataset"}
 
-    dataset = datasets[0] if isinstance(datasets[0], dict) else {}
     dataset_id = dataset.get("id")
 
     if not dataset_id:
         return {"dataset_id": None, "error": "dataset_id_missing"}
 
-    # Fetch evaluation scores for this dataset
+    # 2. Fetch latest experiment for this dataset
     try:
-        eval_data = await call_tool(
+        experiments_data = await call_tool(
             MCPServer.ARIZE,
-            "getDataset",
-            {"datasetId": dataset_id, "includeEvaluations": True},
+            "list-experiments-for-dataset",
+            {"dataset_id": dataset_id, "limit": 1},
         )
     except MCPCallError as exc:
-        logger.warning("Arize eval fetch failed for dataset %s: %s", dataset_id, exc)
-        eval_data = {}
+        logger.warning("Arize experiments fetch failed for dataset %s: %s", dataset_id, exc)
+        experiments_data = []
 
-    if not isinstance(eval_data, dict):
-        eval_data = {}
+    experiments = experiments_data if isinstance(experiments_data, list) else []
+    
+    if not experiments:
+        logger.warning("No experiments found for dataset %s", dataset_id)
+        return {
+            "dataset_id": dataset_id,
+            "hallucination_score": 0.0,
+            "relevance_score": 0.0,
+            "groundedness_score": 0.0,
+            "span_count": 0,
+        }
 
-    evals = eval_data.get("evaluations", eval_data)
+    experiment_id = experiments[0].get("id")
+
+    # 3. Get experiment details to calculate scores
+    try:
+        experiment_details = await call_tool(
+            MCPServer.ARIZE,
+            "get-experiment-by-id",
+            {"experiment_id": experiment_id},
+        )
+    except MCPCallError as exc:
+        logger.warning("Arize experiment details fetch failed for experiment %s: %s", experiment_id, exc)
+        experiment_details = []
+
+    # get-experiment-by-id returns metadata in block 0 and results in block 1
+    # call_tool might return a list of parsed JSON if there are multiple text blocks
+    results = []
+    if isinstance(experiment_details, list):
+        for item in experiment_details:
+            if isinstance(item, dict) and "results" in item:
+                results = item.get("results", [])
+                break
+    elif isinstance(experiment_details, dict):
+        results = experiment_details.get("results", [])
+
+    # Calculate means from annotations
+    hal_scores, rel_scores, grnd_scores = [], [], []
+    for r in results:
+        for ann in r.get("annotations", []):
+            name = ann.get("name", "").lower()
+            score = ann.get("result", {}).get("score")
+            if score is not None:
+                if "hallucination" in name:
+                    hal_scores.append(score)
+                elif "relevance" in name:
+                    rel_scores.append(score)
+                elif "groundedness" in name:
+                    grnd_scores.append(score)
+
+    def _mean(vals: list[float]) -> float:
+        return sum(vals) / len(vals) if vals else 0.0
 
     return {
         "dataset_id": dataset_id,
-        "hallucination_score": (
-            evals.get("hallucination", {}).get("mean", 0.0)
-            if isinstance(evals.get("hallucination"), dict)
-            else evals.get("hallucination_score", 0.0)
-        ),
-        "relevance_score": (
-            evals.get("relevance", {}).get("mean", 0.0)
-            if isinstance(evals.get("relevance"), dict)
-            else evals.get("relevance_score", 0.0)
-        ),
-        "groundedness_score": (
-            evals.get("groundedness", {}).get("mean", 0.0)
-            if isinstance(evals.get("groundedness"), dict)
-            else evals.get("groundedness_score", 0.0)
-        ),
-        "span_count": dataset.get("span_count", 0),
+        "hallucination_score": _mean(hal_scores),
+        "relevance_score": _mean(rel_scores),
+        "groundedness_score": _mean(grnd_scores),
+        "span_count": len(results),
     }
 
 
@@ -124,10 +153,11 @@ async def run_eval(
     baseline_dataset_id: str | None,
 ) -> ArizeEvalResult:
     """
-    Submit simulation LLM outputs to Arize evaluators via MCP and compute quality deltas.
+    Submit simulation LLM outputs to Arize via MCP for evaluation.
 
-    Runs hallucination, relevance, and groundedness evaluators on simulation
-    outputs, then compares against the production baseline dataset.
+    Since @arizeai/phoenix-mcp does not provide a synchronous `runEval` tool,
+    we push the simulation outputs as examples to the simulation dataset,
+    and return the eval result indicating that synchronous evaluation is unsupported.
 
     Args:
         simulation_id: The simulation identifier (used for Arize dataset naming).
@@ -146,95 +176,49 @@ async def run_eval(
         )
 
     logger.info(
-        "Running Arize evaluators on %d simulation outputs (sim: %s)",
+        "Adding %d simulation outputs as examples to Arize (sim: %s)",
         len(simulation_outputs),
         simulation_id,
     )
 
     try:
-        # 1. Log spans to create a simulation dataset in Arize
-        log_result = await call_tool(
+        dataset_name = f"bulwark-sim-{simulation_id}"
+        examples = []
+        for out in simulation_outputs:
+            examples.append({
+                "input": {"prompt": out.get("prompt", "")},
+                "output": {"response": out.get("response", "")},
+                "metadata": {"simulation_id": simulation_id}
+            })
+
+        # 1. Log spans / add examples to a simulation dataset in Arize
+        await call_tool(
             MCPServer.ARIZE,
-            "logSpans",
+            "add-dataset-examples",
             {
-                "modelId": f"bulwark-{simulation_id}",
-                "environment": "simulation",
-                "datasetName": f"bulwark-sim-{simulation_id}",
-                "spans": simulation_outputs,
+                "dataset_name": dataset_name,
+                "examples": examples,
             },
         )
-        sim_dataset_id: str | None = None
-        if isinstance(log_result, dict):
-            sim_dataset_id = log_result.get("dataset_id") or log_result.get("id")
-
-        # 2. Run evaluators (hallucination, relevance, groundedness)
-        eval_result = await call_tool(
-            MCPServer.ARIZE,
-            "runEval",
-            {
-                "datasetId": sim_dataset_id,
-                "modelId": f"bulwark-{simulation_id}",
-                "evaluators": ["hallucination", "relevance", "groundedness"],
-                "waitForCompletion": True,
-                "timeoutSeconds": 55,
-                "spans": simulation_outputs if not sim_dataset_id else None,
-            },
-        )
-        if not isinstance(eval_result, dict):
-            eval_result = {}
-
-        # 3. Compare against baseline dataset if available
-        deltas: dict[str, float | None] = {
-            "hallucination": None,
-            "relevance": None,
-            "groundedness": None,
-        }
-        baseline_scores: dict[str, float | None] = {
-            "hallucination": None,
-            "relevance": None,
-            "groundedness": None,
-        }
-
-        if baseline_dataset_id and sim_dataset_id:
-            comparison = await call_tool(
-                MCPServer.ARIZE,
-                "compareDatasets",
-                {
-                    "baselineDatasetId": baseline_dataset_id,
-                    "comparisonDatasetId": sim_dataset_id,
-                    "metrics": ["hallucination", "relevance", "groundedness"],
-                },
-            )
-            if isinstance(comparison, dict):
-                for metric in ["hallucination", "relevance", "groundedness"]:
-                    baseline_val = comparison.get("baseline", {}).get(metric)
-                    sim_val = comparison.get("comparison", {}).get(metric)
-                    baseline_scores[metric] = baseline_val
-                    if sim_val is not None and baseline_val is not None:
-                        deltas[metric] = sim_val - baseline_val
+        sim_dataset_id = dataset_name # Using name as identifier for simplicity since we can't easily fetch the ID immediately
 
         duration_ms = int((time.time() - start_time) * 1000)
 
-        def _get_score(key: str) -> float | None:
-            v = eval_result.get(key, {})
-            if isinstance(v, dict):
-                return v.get("mean")
-            return float(v) if v is not None else None
-
         return ArizeEvalResult(
             llm_detected=True,
-            hallucination_delta=deltas["hallucination"],
-            relevance_delta=deltas["relevance"],
-            groundedness_delta=deltas["groundedness"],
-            sim_hallucination_score=_get_score("hallucination"),
-            sim_relevance_score=_get_score("relevance"),
-            sim_groundedness_score=_get_score("groundedness"),
-            baseline_hallucination_score=baseline_scores["hallucination"],
-            baseline_relevance_score=baseline_scores["relevance"],
-            baseline_groundedness_score=baseline_scores["groundedness"],
+            hallucination_delta=None,
+            relevance_delta=None,
+            groundedness_delta=None,
+            sim_hallucination_score=None,
+            sim_relevance_score=None,
+            sim_groundedness_score=None,
+            baseline_hallucination_score=None,
+            baseline_relevance_score=None,
+            baseline_groundedness_score=None,
             eval_dataset_id=sim_dataset_id,
             baseline_dataset_id=baseline_dataset_id,
             eval_duration_ms=duration_ms,
+            skip_reason="Synchronous evaluation and dataset comparison is unsupported by official Phoenix MCP."
         )
 
     except MCPConfigError:
@@ -257,8 +241,11 @@ async def log_spans(simulation_id: str, traces: list[dict[str, Any]]) -> bool:
     """
     Archive simulation LLM traces into Arize for observability via MCP.
 
+    Uses `add-dataset-examples` to push the traces into a simulation dataset,
+    as Phoenix MCP does not natively expose an OTLP `log-spans` tool.
+
     Args:
-        simulation_id: The simulation ID (used as model_id in Arize).
+        simulation_id: The simulation ID.
         traces: List of trace dicts {prompt, response, latency_ms, model, ...}.
 
     Returns:
@@ -267,18 +254,26 @@ async def log_spans(simulation_id: str, traces: list[dict[str, Any]]) -> bool:
     if not traces:
         return True
 
-    logger.info("Logging %d spans to Arize for simulation %s", len(traces), simulation_id)
+    logger.info("Logging %d spans as examples to Arize for simulation %s", len(traces), simulation_id)
     try:
+        dataset_name = f"bulwark-traces-{simulation_id}"
+        examples = []
+        for trace in traces:
+            examples.append({
+                "input": {"prompt": trace.get("prompt", trace.get("input", ""))},
+                "output": {"response": trace.get("response", trace.get("output", ""))},
+                "metadata": trace
+            })
+
         await call_tool(
             MCPServer.ARIZE,
-            "logSpans",
+            "add-dataset-examples",
             {
-                "modelId": f"bulwark-{simulation_id}",
-                "environment": "simulation",
-                "spans": traces,
+                "dataset_name": dataset_name,
+                "examples": examples,
             },
         )
-        logger.info("Arize span logging complete for %s", simulation_id)
+        logger.info("Arize trace logging complete for %s", simulation_id)
         return True
     except MCPConfigError:
         raise
