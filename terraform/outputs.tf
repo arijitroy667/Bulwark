@@ -18,7 +18,7 @@ output "orchestrator_worker_url" {
 }
 
 output "orchestrator_pubsub_endpoint" {
-  description = "Pub/Sub push endpoint for the orchestrator worker"
+  description = "Endpoint for Orchestrator Pub/Sub pushes"
   value       = "${google_cloud_run_v2_service.orchestrator_worker.uri}/pubsub/orchestrate"
 }
 

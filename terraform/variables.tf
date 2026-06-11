@@ -48,8 +48,22 @@ variable "gitlab_pat" {
   default     = ""
 }
 
-variable "dynatrace_api_token" {
-  description = "Dynatrace API Token"
+variable "dynatrace_client_id" {
+  description = "Dynatrace OAuth Client ID"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "dynatrace_client_secret" {
+  description = "Dynatrace OAuth Client Secret"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "dynatrace_account_urn" {
+  description = "Dynatrace OAuth Account URN"
   type        = string
   sensitive   = true
   default     = ""
@@ -73,6 +87,12 @@ variable "arize_space_key" {
   description = "Arize Space Key"
   type        = string
   sensitive   = true
+  default     = ""
+}
+
+variable "phoenix_collector_endpoint" {
+  description = "Phoenix Collector Endpoint"
+  type        = string
   default     = ""
 }
 

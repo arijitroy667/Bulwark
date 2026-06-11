@@ -37,9 +37,9 @@ resource "google_secret_manager_secret_version" "gitlab_pat" {
   secret_data = var.gitlab_pat
 }
 
-# ── Dynatrace API Token ──
-resource "google_secret_manager_secret" "dynatrace_api_token" {
-  secret_id = "DYNATRACE_API_TOKEN"
+# ── Dynatrace Client ID ──
+resource "google_secret_manager_secret" "dynatrace_client_id" {
+  secret_id = "DYNATRACE_CLIENT_ID"
 
   replication {
     auto {}
@@ -48,9 +48,41 @@ resource "google_secret_manager_secret" "dynatrace_api_token" {
   depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
 }
 
-resource "google_secret_manager_secret_version" "dynatrace_api_token" {
-  secret      = google_secret_manager_secret.dynatrace_api_token.id
-  secret_data = var.dynatrace_api_token
+resource "google_secret_manager_secret_version" "dynatrace_client_id" {
+  secret      = google_secret_manager_secret.dynatrace_client_id.id
+  secret_data = var.dynatrace_client_id
+}
+
+# ── Dynatrace Client Secret ──
+resource "google_secret_manager_secret" "dynatrace_client_secret" {
+  secret_id = "DYNATRACE_CLIENT_SECRET"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
+}
+
+resource "google_secret_manager_secret_version" "dynatrace_client_secret" {
+  secret      = google_secret_manager_secret.dynatrace_client_secret.id
+  secret_data = var.dynatrace_client_secret
+}
+
+# ── Dynatrace Account URN ──
+resource "google_secret_manager_secret" "dynatrace_account_urn" {
+  secret_id = "DYNATRACE_ACCOUNT_URN"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
+}
+
+resource "google_secret_manager_secret_version" "dynatrace_account_urn" {
+  secret      = google_secret_manager_secret.dynatrace_account_urn.id
+  secret_data = var.dynatrace_account_urn
 }
 
 # ── Dynatrace Environment ID ──

@@ -137,7 +137,7 @@ resource "google_pubsub_subscription" "orchestrator_sub" {
 
   dead_letter_policy {
     dead_letter_topic     = google_pubsub_topic.dead_letter.id
-    max_delivery_attempts = 3
+    max_delivery_attempts = 5
   }
 
   depends_on = [
@@ -175,7 +175,7 @@ resource "google_cloud_run_v2_service" "webhook_receiver" {
 
       env {
         name  = "BULWARK_MODE"
-        value = var.environment
+        value = "production"
       }
 
       env {
@@ -323,10 +323,30 @@ resource "google_cloud_run_v2_service" "orchestrator_worker" {
       }
 
       env {
-        name = "DYNATRACE_API_TOKEN"
+        name = "DYNATRACE_CLIENT_ID"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.dynatrace_api_token.secret_id
+            secret  = google_secret_manager_secret.dynatrace_client_id.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "DYNATRACE_CLIENT_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.dynatrace_client_secret.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "DYNATRACE_ACCOUNT_URN"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.dynatrace_account_urn.secret_id
             version = "latest"
           }
         }
@@ -360,6 +380,11 @@ resource "google_cloud_run_v2_service" "orchestrator_worker" {
             version = "latest"
           }
         }
+      }
+
+      env {
+        name  = "PHOENIX_COLLECTOR_ENDPOINT"
+        value = var.phoenix_collector_endpoint
       }
 
       env {
@@ -429,6 +454,15 @@ resource "google_cloud_run_v2_service_iam_member" "webhook_public" {
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.webhook_receiver.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+# Allow public access so the React dashboard can hit the API endpoints
+resource "google_cloud_run_v2_service_iam_member" "orchestrator_public" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.orchestrator_worker.name
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
