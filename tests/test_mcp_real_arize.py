@@ -13,11 +13,16 @@ Covers:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from orchestrator.tools.arize_tool import get_llm_baseline, log_spans, run_eval
 from shared.mcp_client import MCPConfigError, MCPServer, call_tool
 from shared.models import ArizeEvalResult
+
+# What the (Gemini) judge returns for the simulation outputs in these tests
+JUDGED = {"hallucination": 0.07, "relevance": 0.91, "groundedness": 0.87, "count": 1}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,12 +180,21 @@ class TestRunEval:
         assert result.llm_detected is True
 
     @pytest.mark.asyncio
-    async def test_run_eval_no_skip_reason_on_success(self, arize_server_state):
-        """Successful eval has no skip_reason."""
+    async def test_run_eval_no_skip_reason_on_success(self, arize_server_state, monkeypatch):
+        """Judge available + scored baseline → full result, examples archived in Phoenix."""
+        monkeypatch.setattr("orchestrator.tools.arize_tool.judge_llm_outputs", AsyncMock(return_value=JUDGED))
         outputs = [{"prompt": "Test", "response": "Response"}]
-        result = await run_eval("sim-test-42", outputs, baseline_dataset_id=None)
-        # skip_reason may be None or empty string on success
+        baseline = await get_llm_baseline("demo-app")
+        result = await run_eval("sim-test-42", outputs, baseline_dataset_id=None, baseline_scores=baseline)
         assert not result.skip_reason
+        assert result.arize_span_logged is True
+        assert len(arize_server_state["logged_spans"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_judge_unavailable_skips_with_reason(self, arize_server_state, monkeypatch):
+        monkeypatch.setattr("orchestrator.tools.arize_tool.judge_llm_outputs", AsyncMock(return_value=None))
+        result = await run_eval("sim-test-42", [{"prompt": "p", "response": "r"}], baseline_dataset_id=None)
+        assert result.skip_reason and "evaluators unavailable" in result.skip_reason
 
     @pytest.mark.asyncio
     async def test_empty_outputs_returns_skip(self, arize_server_state):
@@ -191,28 +205,21 @@ class TestRunEval:
         assert "No LLM outputs" in result.skip_reason
 
     @pytest.mark.asyncio
-    async def test_with_baseline_dataset_id_calls_compare(self, arize_server_state):
-        """
-        When baseline_dataset_id is provided, compareDatasets is called.
-        The local server returns comparison_results which has delta keys.
-        However, the function expects baseline/comparison sub-keys.
-        Deltas remain None (graceful); the result is still ArizeEvalResult.
-        """
-        arize_server_state["comparison_results"] = {
-            "baseline": {"hallucination": 0.05, "relevance": 0.92, "groundedness": 0.88},
-            "comparison": {"hallucination": 0.07, "relevance": 0.91, "groundedness": 0.87},
-        }
-        outputs = [{"prompt": "Test", "response": "Answer"}]
+    async def test_deltas_vs_arize_baseline_signed_as_degradation(self, arize_server_state, monkeypatch):
+        """Baseline (0.05 / 0.92 / 0.88) vs judged sim (0.07 / 0.91 / 0.87):
+        positive deltas mean degradation for all three evaluators."""
+        monkeypatch.setattr("orchestrator.tools.arize_tool.judge_llm_outputs", AsyncMock(return_value=JUDGED))
+        baseline = await get_llm_baseline("demo-app")
         result = await run_eval(
             "sim-with-baseline",
-            outputs,
-            baseline_dataset_id="baseline-dataset-001",
+            [{"prompt": "Test", "response": "Answer"}],
+            baseline_dataset_id=baseline["dataset_id"],
+            baseline_scores=baseline,
         )
-        assert isinstance(result, ArizeEvalResult)
-        assert result.llm_detected is True
-        # Deltas should now be computed from baseline/comparison sub-keys
-        assert result.hallucination_delta is not None
-        assert abs(result.hallucination_delta - 0.02) < 0.001
+        assert abs(result.hallucination_delta - 0.02) < 0.001   # 0.07 - 0.05
+        assert abs(result.relevance_delta - 0.01) < 0.001       # 0.92 - 0.91
+        assert abs(result.groundedness_delta - 0.01) < 0.001    # 0.88 - 0.87
+        assert result.baseline_dataset_id == "baseline-dataset-001"
 
     @pytest.mark.asyncio
     async def test_run_eval_call_tool_directly(self, arize_server_state):

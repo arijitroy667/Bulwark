@@ -21,6 +21,7 @@ Key v3 corrections from v1:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -35,9 +36,9 @@ logger = logging.getLogger("bulwark.reasoning")
 # Constants — PRD §8 noise floors
 # ──────────────────────────────────────────────
 
-P95_NOISE_FLOOR_MS = 35.0       # ±35ms (v1 had ±20ms — below measurement noise)
-ERROR_RATE_NOISE_FLOOR = 1.0    # ±1.0% binomial noise at n=200
-LLM_EVAL_NOISE_BAND = 0.10      # ±0.08–0.10 Arize evaluator noise
+P95_NOISE_FLOOR_MS = settings.p95_noise_floor_ms                 # ±35ms default
+ERROR_RATE_NOISE_FLOOR = settings.error_rate_noise_floor_percent  # ±1.0% at n=200
+LLM_EVAL_NOISE_BAND = settings.llm_eval_noise_band               # ±0.08–0.10 Arize noise
 
 
 # ──────────────────────────────────────────────
@@ -196,6 +197,45 @@ def _compute_overall_score(
     return max(0, min(100, int(round(overall))))
 
 
+HIGH_CONFIDENCE_P95_DELTA_MS = 100.0  # PRD §8.2 tier: "> +100 ms — 3x+ noise floor"
+
+
+def _slo_breaches(replay: ReplayResult, baseline: ServiceBaseline) -> list[str]:
+    """High-confidence regressions that also push the service past its SLO.
+
+    The §8.5 weights alone cannot BLOCK a pure latency regression (infra is
+    40% of the score), so an SLO breach acts as a hard gate on top of them.
+    """
+    if replay.skip_reason or not replay.total_requests:
+        return []
+    breaches = []
+    if (
+        replay.latency_delta_p95_ms > HIGH_CONFIDENCE_P95_DELTA_MS
+        and replay.actual_p95_ms > baseline.slo_latency_budget_p95_ms
+    ):
+        breaches.append(
+            f"SLO breach: simulated p95 {replay.actual_p95_ms:.0f}ms exceeds the "
+            f"{baseline.slo_latency_budget_p95_ms:.0f}ms p95 budget "
+            f"(+{replay.latency_delta_p95_ms:.0f}ms vs baseline, high-confidence regression)"
+        )
+    if (
+        replay.error_rate_delta_percent > ERROR_RATE_NOISE_FLOOR
+        and replay.actual_error_rate_percent > baseline.slo_error_budget_percent
+    ):
+        breaches.append(
+            f"SLO breach: simulated error rate {replay.actual_error_rate_percent:.2f}% exceeds the "
+            f"{baseline.slo_error_budget_percent:.1f}% error budget"
+        )
+    return breaches
+
+
+def _apply_slo_gate(overall_score: int, breaches: list[str]) -> int:
+    """An SLO breach caps the score just below the WARNING band → BLOCKED."""
+    if breaches:
+        return min(overall_score, settings.confidence_threshold_warning - 1)
+    return overall_score
+
+
 def _score_to_verdict(overall_score: int) -> VerdictStatus:
     """Map overall score to verdict (PRD §8.6)."""
     if overall_score >= settings.confidence_threshold_approved:
@@ -253,11 +293,14 @@ def compute_scores_locally(
     infra_score = _compute_infrastructure_score(replay_result, baseline)
     reliability_score = _compute_reliability_score(replay_result, novel_error_classifications)
     llm_score = _compute_llm_quality_score(arize_result) if arize_result else None
-    overall_score = _compute_overall_score(infra_score, reliability_score, llm_score)
+    slo_breaches = _slo_breaches(replay_result, baseline)
+    overall_score = _apply_slo_gate(
+        _compute_overall_score(infra_score, reliability_score, llm_score), slo_breaches
+    )
     verdict_status = _score_to_verdict(overall_score)
 
     # Build evidence list
-    evidence: list[str] = []
+    evidence: list[str] = list(slo_breaches)
     if replay_result.skip_reason:
         evidence.append(replay_result.skip_reason)
     else:
@@ -353,95 +396,114 @@ async def generate_verdict(
     # Pre-compute deterministic scores (Gemini refines the narrative, not the raw scores)
     pre_scores = compute_scores_locally(replay_result, baseline, arize_result)
 
+    if not settings.gemini_api_key:
+        logger.warning("GEMINI_API_KEY not set — using deterministic threshold verdict")
+        return _deterministic_fallback(pre_scores)
+
+    prompt = _build_gemini_prompt(
+        diff_summary=diff_summary,
+        replay_result=replay_result,
+        baseline=baseline,
+        service_name=service_name,
+        pre_scores=pre_scores,
+        arize_result=arize_result,
+        historical_context=historical_context or [],
+    )
+
     start_time = time.time()
+    verdict_data: dict[str, Any] | None = None
+    for attempt in (1, 2):  # PRD §16: retry once after 5 s, then fall back
+        try:
+            logger.info("Calling Gemini %s for verdict reasoning (attempt %d)...", settings.gemini_model, attempt)
+            verdict_data = await _call_gemini(prompt)
+            break
+        except Exception as e:
+            logger.error("Gemini reasoning failed (attempt %d/2): %s: %s", attempt, type(e).__name__, e)
+            if attempt == 1:
+                await asyncio.sleep(5)
 
-    try:
-        from google import genai
-        from google.genai import types
+    if verdict_data is None:
+        return _deterministic_fallback(pre_scores)
 
-        client = genai.Client(api_key=settings.gemini_api_key)
+    duration_ms = int((time.time() - start_time) * 1000)
+    logger.info("Gemini verdict: %s in %dms", verdict_data.get("verdict"), duration_ms)
 
-        prompt = _build_gemini_prompt(
-            diff_summary=diff_summary,
-            replay_result=replay_result,
-            baseline=baseline,
-            service_name=service_name,
-            pre_scores=pre_scores,
-            arize_result=arize_result,
-            historical_context=historical_context or [],
-        )
+    # Keep only well-formed classifications; scores are always recomputed locally
+    classification = {
+        k: v for k, v in (verdict_data.get("novel_error_classification") or {}).items()
+        if isinstance(v, dict)
+    }
+    novel_classifications = {k: v.get("assessment", "uncertain") for k, v in classification.items()}
+    reliability_score = _compute_reliability_score(replay_result, novel_classifications)
+    llm_score = pre_scores.llm_quality_score
+    slo_breaches = _slo_breaches(replay_result, baseline)
+    overall_score = _apply_slo_gate(
+        _compute_overall_score(pre_scores.infrastructure_score, reliability_score, llm_score),
+        slo_breaches,
+    )
+    evidence = verdict_data.get("evidence")
+    if not (isinstance(evidence, list) and all(isinstance(e, str) for e in evidence)):
+        evidence = pre_scores.evidence
+    evidence = [b for b in slo_breaches if b not in evidence] + evidence
 
-        logger.info("Calling Gemini %s for verdict reasoning...", settings.gemini_model)
-        response = client.models.generate_content(
+    return VerdictResult(
+        infrastructure_score=pre_scores.infrastructure_score,
+        reliability_score=reliability_score,
+        llm_quality_score=llm_score,
+        overall_score=overall_score,
+        verdict=_score_to_verdict(overall_score),
+        summary=str(verdict_data.get("summary") or pre_scores.summary),
+        evidence=evidence,
+        novel_error_classification=classification,
+        historical_note=str(verdict_data.get("historical_note") or ""),
+        recommendation=str(verdict_data.get("recommendation") or ""),
+        uncertainty_acknowledgement=str(
+            verdict_data.get("uncertainty_acknowledgement")
+            or _build_uncertainty_acknowledgement(replay_result, baseline)
+        ),
+        gemini_model=settings.gemini_model,
+        reasoning_duration_ms=duration_ms,
+    )
+
+
+GEMINI_TIMEOUT_S = 30.0  # PRD §12.1 hard ceiling for the reasoning call
+
+
+async def _call_gemini(prompt: str) -> dict[str, Any]:
+    """One async Gemini call returning the parsed JSON verdict object."""
+    from google import genai
+    from google.genai import types
+
+    key = settings.gemini_api_key
+    # "AQ." keys are Vertex AI express-mode keys (aiplatform.googleapis.com);
+    # AI Studio keys ("AIza...") use the Gemini API.
+    client = genai.Client(api_key=key, vertexai=key.startswith("AQ."))
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,  # Low temperature for consistent structured output
             ),
-        )
+        ),
+        timeout=GEMINI_TIMEOUT_S,
+    )
+    data = json.loads(response.text or "")
+    if not isinstance(data, dict):
+        raise ValueError("Gemini returned JSON that is not an object")
+    return data
 
-        raw_json = response.text
-        verdict_data = json.loads(raw_json)
 
-        duration_ms = int((time.time() - start_time) * 1000)
-        logger.info("Gemini verdict: %s (%d/100) in %dms", verdict_data.get("verdict"), verdict_data.get("overall_score"), duration_ms)
-
-        # Merge Gemini's novel error classifications back into pre_scores reliability score
-        novel_classifications = {
-            k: v.get("assessment", "uncertain")
-            for k, v in verdict_data.get("novel_error_classification", {}).items()
-        }
-        # Recompute reliability with Gemini's classifications
-        reliability_score = _compute_reliability_score(replay_result, novel_classifications)
-        llm_score = pre_scores.llm_quality_score
-        overall_score = _compute_overall_score(pre_scores.infrastructure_score, reliability_score, llm_score)
-        final_verdict = _score_to_verdict(overall_score)
-
-        return VerdictResult(
-            infrastructure_score=pre_scores.infrastructure_score,
-            reliability_score=reliability_score,
-            llm_quality_score=llm_score,
-            overall_score=overall_score,
-            verdict=final_verdict,
-            summary=verdict_data.get("summary", pre_scores.summary),
-            evidence=verdict_data.get("evidence", pre_scores.evidence),
-            novel_error_classification=verdict_data.get("novel_error_classification", {}),
-            historical_note=verdict_data.get("historical_note", ""),
-            recommendation=verdict_data.get("recommendation", ""),
-            uncertainty_acknowledgement=verdict_data.get(
-                "uncertainty_acknowledgement",
-                _build_uncertainty_acknowledgement(replay_result, baseline),
-            ),
-            gemini_model=settings.gemini_model,
-            reasoning_duration_ms=duration_ms,
-        )
-
-    except json.JSONDecodeError as e:
-        logger.error("Gemini returned invalid JSON: %s", e)
-        # Fall back to deterministic scoring
-        return pre_scores
-
-    except Exception as e:
-        logger.error("Gemini reasoning failed: %s — falling back to threshold logic", e)
-        # Retry once after 5 seconds (per PRD §16)
-        if "retry" not in str(type(e).__name__).lower():
-            try:
-                import asyncio
-                await asyncio.sleep(5)
-                return await generate_verdict(
-                    diff_summary, replay_result, baseline, service_name,
-                    arize_result, historical_context,
-                )
-            except Exception as retry_e:
-                logger.error("Gemini retry also failed: %s", retry_e)
-
-        fallback = compute_scores_locally(replay_result, baseline, arize_result)
-        fallback.recommendation = (
-            "Gemini reasoning unavailable — verdict based on threshold logic only. "
-            + fallback.recommendation
-        )
-        return fallback
+def _deterministic_fallback(pre_scores: VerdictResult) -> VerdictResult:
+    """Threshold-only verdict used when Gemini is unavailable (PRD §16)."""
+    fallback = pre_scores.model_copy(deep=True)
+    fallback.gemini_model = "deterministic-fallback"
+    fallback.recommendation = (
+        fallback.recommendation
+        or "Gemini reasoning unavailable — verdict based on threshold logic only."
+    )
+    return fallback
 
 
 # ──────────────────────────────────────────────
@@ -469,13 +531,14 @@ def _build_gemini_prompt(
     if historical_context:
         history_parts = []
         for i, sim in enumerate(historical_context):
-            verdict_info = sim.get("verdict", {})
+            verdict_info = sim.get("verdict") or {}
             v = verdict_info.get("verdict", "UNKNOWN")
             score = verdict_info.get("overall_score", 0)
-            p95_delta = sim.get("dynatrace", {}).get("replay_result", {}).get("latency_delta_p95_ms", 0)
-            err_delta = sim.get("dynatrace", {}).get("replay_result", {}).get("error_rate_delta_percent", 0)
-            override = sim.get("gitlab", {}).get("override_applied", False)
-            created = sim.get("created_at", "")
+            replay_info = (sim.get("dynatrace") or {}).get("replay_result") or {}
+            p95_delta = replay_info.get("latency_delta_p95_ms") or 0
+            err_delta = replay_info.get("error_rate_delta_percent") or 0
+            override = (sim.get("gitlab") or {}).get("override_applied", False)
+            created = str(sim.get("created_at", ""))  # Mongo returns datetime
             override_note = " [OVERRIDE APPLIED by engineer]" if override else ""
             history_parts.append(
                 f"  {i+1}. {created[:10]}: {v} ({score}/100) | "
@@ -491,15 +554,16 @@ def _build_gemini_prompt(
         if arize_result.skip_reason:
             arize_text = f"Arize evaluation: Skipped — {arize_result.skip_reason}"
         else:
-            arize_text = (
-                f"Arize LLM evaluation:\n"
-                f"  Hallucination delta: {arize_result.hallucination_delta:+.3f} "
-                f"({'ABOVE' if (arize_result.hallucination_delta or 0) > 0.10 else 'within'} noise band)\n"
-                f"  Relevance delta: {arize_result.relevance_delta:+.3f} "
-                f"({'ABOVE' if (arize_result.relevance_delta or 0) > 0.10 else 'within'} noise band)\n"
-                f"  Groundedness delta: {arize_result.groundedness_delta:+.3f} "
-                f"({'ABOVE' if (arize_result.groundedness_delta or 0) > 0.10 else 'within'} noise band)"
-            )
+            lines = ["Arize LLM evaluation (deltas signed so positive = degradation):"]
+            for label, d in (
+                ("Hallucination", arize_result.hallucination_delta),
+                ("Relevance drop", arize_result.relevance_delta),
+                ("Groundedness drop", arize_result.groundedness_delta),
+            ):
+                d = d or 0.0
+                band = "ABOVE" if d > LLM_EVAL_NOISE_BAND else "within"
+                lines.append(f"  {label} delta: {d:+.3f} ({band} noise band)")
+            arize_text = "\n".join(lines)
 
     novel_errors_text = "None."
     if replay_result.novel_error_messages:
@@ -541,6 +605,7 @@ Service: {service_name}
 - LLM quality score: {pre_scores.llm_quality_score if pre_scores.llm_quality_score is not None else 'N/A (no LLM detected)'}
 - Overall score: {pre_scores.overall_score}/100
 - Noise floors applied: ±35ms p95 latency, ±1.0% error rate
+- SLO gate: {"; ".join(_slo_breaches(replay_result, baseline)) or "no SLO breach"} (a breach forces BLOCKED, overall capped at 49)
 
 ## {arize_text}
 
@@ -576,6 +641,6 @@ Service: {service_name}
   "uncertainty_acknowledgement": "p95 computed from {replay_result.total_requests} samples; measurement uncertainty ±35ms. LLM evaluator noise band: ±0.08. Signals within these bands are informational observations, not scored regressions. Bulwark flags probable regressions — it does not certify safety. Human judgement is the final gate."
 }}
 
-Important: infrastructure_score is fixed at {pre_scores.infrastructure_score}. Recompute reliability_score based on your novel error classifications (code_regression=-25, uncertain=-10, stub_artefact=0 per novel error). Then recompute overall_score using the formula: infra×0.{30 if pre_scores.llm_quality_score is not None else 40} + reliability×0.{40 if pre_scores.llm_quality_score is not None else 60}{' + llm×0.30' if pre_scores.llm_quality_score is not None else ''}. APPROVED≥80, WARNING≥50, BLOCKED<50."""
+Important: infrastructure_score is fixed at {pre_scores.infrastructure_score}. Recompute reliability_score based on your novel error classifications (code_regression=-25, uncertain=-10, stub_artefact=0 per novel error). Then recompute overall_score using the formula: infra×0.{30 if pre_scores.llm_quality_score is not None else 40} + reliability×0.{40 if pre_scores.llm_quality_score is not None else 60}{' + llm×0.30' if pre_scores.llm_quality_score is not None else ''}, capped at 49 if there is an SLO breach. APPROVED≥80, WARNING≥50, BLOCKED<50."""
 
     return prompt

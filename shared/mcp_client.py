@@ -308,11 +308,11 @@ async def _do_call_with_retry(
             )
             return result
 
-        except MCPCallError as exc:
+        except MCPCallError:
             # Tool-level server error (isError=True) — do not retry
             raise
 
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
             last_exc = MCPCallError(
                 f"MCP call to {server_label}/{tool_name} timed out after {timeout}s"
             )
@@ -372,18 +372,19 @@ async def _do_call(url: str, tool_name: str, args: dict[str, Any], server: MCPSe
     already fully returned by that point.  We detect this situation and return
     the captured result rather than propagating the teardown error.
     """
-    if server == MCPServer.DYNATRACE:
+    if server == MCPServer.DYNATRACE and _is_dynatrace_gateway(url):
         token = await _dynatrace_bearer_token()
         headers = {"Authorization": f"Bearer {token}"}
     else:
         headers = _auth_headers()
 
-    if server == MCPServer.ARIZE:
+    if server == MCPServer.ARIZE and url == ARIZE_STDIO:
+        # Launch the official Phoenix MCP server locally over stdio (needs Node.js)
         from mcp.client.stdio import stdio_client, StdioServerParameters
-        
+
         npx_args = [
             "-y",
-            "@arizeai/phoenix-mcp@latest",
+            PHOENIX_MCP_PACKAGE,
             "--baseUrl",
             settings.phoenix_collector_endpoint,
             "--apiKey",
@@ -450,6 +451,15 @@ async def _do_call(url: str, tool_name: str, args: dict[str, Any], server: MCPSe
             raise
 
         return _extract_result(_result)
+
+
+ARIZE_STDIO = "stdio"  # ARIZE_MCP_URL value that spawns the Phoenix MCP server via npx
+PHOENIX_MCP_PACKAGE = "@arizeai/phoenix-mcp@4.3.18"  # pinned: npx runs it with Arize credentials
+
+
+def _is_dynatrace_gateway(url: str) -> bool:
+    """Only the Dynatrace-hosted MCP gateway needs the SSO platform token."""
+    return ".apps.dynatrace.com" in url
 
 
 def _is_benign_get_405_error(exc: BaseException) -> bool:

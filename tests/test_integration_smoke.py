@@ -318,16 +318,15 @@ class TestDemoScenario:
         # Infrastructure score should be 0 (20 - 40 for 5xx = clamped to 0)
         assert result.infrastructure_score == 0
 
-    def test_n_plus_one_no_five_xx_produces_warning(self):
+    def test_n_plus_one_breaching_slo_is_blocked(self):
         """
-        N+1 regression without 5xx: +187ms p95 + code_regression novel error
-        → WARNING (53/100).
+        PRD §18: N+1 regression, +187ms p95 → 329ms, past the 200ms SLO budget.
 
-        Without 5xx the infrastructure score is 20 (not 0), so:
-        infra×0.40 + reliability×0.60 = 20×0.40 + 75×0.60 = 8+45 = 53 → WARNING
+        The §8.5 weights alone give 20×0.40 + 75×0.60 = 53 (WARNING); the SLO
+        gate caps a high-confidence regression that breaches the SLO at 49 → BLOCKED.
         """
         regressed = ReplayResult(
-            simulation_id="demo-warning",
+            simulation_id="demo-blocked-slo",
             total_requests=200,
             actual_p95_ms=329.0,
             latency_delta_p95_ms=187.0,
@@ -340,8 +339,27 @@ class TestDemoScenario:
             MOCK_BASELINE,
             novel_error_classifications={"ConnectionPool timeout after 500ms": "code_regression"},
         )
+        assert result.verdict == VerdictStatus.BLOCKED
+        assert result.overall_score == 49
+        assert any("SLO breach" in e for e in result.evidence)
+
+    def test_latency_regression_within_slo_is_warning(self):
+        """Same +110ms regression but the service stays under its SLO → no gate, WARNING."""
+        baseline = ServiceBaseline(service_name="demo-app", p95_latency_ms=60.0)
+        regressed = ReplayResult(
+            simulation_id="demo-warning",
+            total_requests=200,
+            actual_p95_ms=170.0,  # below the 200ms default budget
+            latency_delta_p95_ms=110.0,
+            novel_error_messages=["ConnectionPool timeout after 500ms"],
+        )
+        result = compute_scores_locally(
+            regressed,
+            baseline,
+            novel_error_classifications={"ConnectionPool timeout after 500ms": "code_regression"},
+        )
         assert result.verdict == VerdictStatus.WARNING
-        assert 50 <= result.overall_score < 80
+        assert not any("SLO breach" in e for e in result.evidence)
 
     def test_fix_produces_approved_91(self):
         """

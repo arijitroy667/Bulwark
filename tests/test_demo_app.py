@@ -54,25 +54,27 @@ def test_get_metrics():
     assert "user_count" in data
 
 
-def test_get_traces_empty_when_not_llm_demo(monkeypatch):
-    """GET /traces returns empty list when DEMO_VERSION != 'llm-demo'."""
-    import main
-    monkeypatch.setattr(main, "DEMO_VERSION", "baseline")
-    
-    response = client.get("/traces")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["traces"] == []
+def test_traces_record_ticket_summaries(monkeypatch):
+    """Each /tickets/{id}/summary call records a {prompt, response, context} trace."""
+    monkeypatch.setattr(main, "TRACE_BUFFER", main.deque(maxlen=10))
+    assert client.get("/traces").json()["traces"] == []
+
+    assert client.get("/tickets/2/summary").status_code == 200
+    (trace,) = client.get("/traces").json()["traces"]
+    assert "order A-1002" in trace["context"]
+    assert "Use only facts" in trace["prompt"]          # production prompt file
+    assert "charged twice" in trace["response"]
 
 
-def test_get_traces_returns_mock_traces_when_llm_demo(monkeypatch):
-    """GET /traces returns mock traces when DEMO_VERSION == 'llm-demo'."""
-    import main
-    monkeypatch.setattr(main, "DEMO_VERSION", "llm-demo")
-    
-    response = client.get("/traces")
-    assert response.status_code == 200
-    data = response.json()
-    assert len(data["traces"]) == 2
-    assert "prompt" in data["traces"][0]
-    assert "gemini" in data["traces"][0]["model"]
+def test_edited_prompt_changes_traces(monkeypatch):
+    """The llm-regression build uses the edited prompt and over-promises."""
+    monkeypatch.setattr(main, "TRACE_BUFFER", main.deque(maxlen=10))
+    monkeypatch.setattr(main, "DEMO_VERSION", "llm-regression")
+    client.get("/tickets/2/summary")
+    (trace,) = client.get("/traces").json()["traces"]
+    assert "Reassure the customer" in trace["prompt"]
+    assert "refund" in trace["response"] and "charged twice" not in trace["response"]
+
+
+def test_unknown_ticket_404():
+    assert client.get("/tickets/99/summary").status_code == 404

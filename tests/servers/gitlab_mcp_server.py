@@ -1,26 +1,20 @@
 """
-Local GitLab MCP server for Phase 6 tests and E2E Demo proxy.
+Local fake GitLab for tests.
 
-Implements real MCP tools over Streamable-HTTP using FastMCP.
-If settings.gitlab_pat is configured with a real token (starts with glpat-)
-and demo mode is active, the server proxies all calls to the real GitLab API.
-Otherwise, it returns mock data from the state dictionary (fallback/test mode).
+Serves the same in-memory state two ways:
+  * MCP tools over Streamable-HTTP (FastMCP) — raw MCP round-trip tests
+  * GitLab REST v4 routes (/api/v4/...) — used by orchestrator.tools.gitlab_tool,
+    which talks to GitLab over REST
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import urllib.parse
 from typing import Any
 
-import httpx
 from mcp.server.fastmcp import FastMCP
-
-from shared.config import settings
-from shared.demo_mode import is_demo_mode_active
-
-logger = logging.getLogger("bulwark.gitlab-mcp-server")
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared state — tests read/write this to control server responses
@@ -57,10 +51,9 @@ state: dict[str, Any] = {
     "files": {
         "src/main.py": "for user in users:\n    prefs = db.query(user.id)\n",
     },
-    "comments": [],          # populated by createMergeRequestNote calls
-    "pipeline_statuses": [], # populated by createPipelineStatus calls
-    "approvals": [],         # populated by updateMergeRequest calls
-    # Incrementing ID for note/status responses
+    "comments": [],          # populated by note creation
+    "pipeline_statuses": [], # populated by commit status creation
+    "approvals": [],         # populated by approve/unapprove
     "_next_note_id": 1001,
 }
 
@@ -73,71 +66,29 @@ def reset_state() -> None:
     state["_next_note_id"] = 1001
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper for proxying to real GitLab API
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def _get_active_pat() -> str:
-    """Fetch the active GitLab PAT from MongoDB, falling back to settings."""
-    try:
-        from shared.db import get_gitlab_pat
-        return await get_gitlab_pat()
-    except Exception:
-        pass
-    return settings.gitlab_pat
+def _add_comment(project_id: str, iid: int, body: str) -> dict[str, Any]:
+    note_id = state["_next_note_id"]
+    state["_next_note_id"] += 1
+    state["comments"].append({"id": note_id, "body": body, "project_id": project_id, "mr_iid": iid})
+    return {"id": note_id, "body": body}
 
 
-async def _is_real_token() -> bool:
-    """Check if settings has a real GitLab PAT configured and demo mode is active."""
-    if not await is_demo_mode_active():
-        return False
-    pat = await _get_active_pat()
-    pat = pat.strip() if pat else ""
-    return bool(pat and (pat.startswith("glpat-") or len(pat) > 10))
+def _add_status(sha: str, status: str, name: str, description: str) -> dict[str, Any]:
+    state["pipeline_statuses"].append(
+        {"sha": sha, "state": status, "name": name, "description": description}
+    )
+    return {"id": 9001, "sha": sha, "status": status}
 
 
-async def _call_gitlab_api(method: str, path: str, json_data: Any = None) -> Any:
-    """Proxy HTTP call to the real GitLab API."""
-    pat = await _get_active_pat()
-    url = f"{settings.gitlab_url.rstrip('/')}/api/v4/{path}"
-    headers = {
-        "PRIVATE-TOKEN": pat,
-        "Accept": "application/json",
-    }
-    logger.info("Proxying %s to real GitLab: %s", method, url)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        if method.upper() == "GET":
-            resp = await client.get(url, headers=headers)
-        elif method.upper() == "POST":
-            resp = await client.post(url, headers=headers, json=json_data)
-        elif method.upper() == "PUT":
-            resp = await client.put(url, headers=headers, json=json_data)
-        else:
-            return None
-        
-        if resp.status_code >= 400:
-            logger.warning("GitLab API error %d: %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-        return resp.json()
-
-
-async def _call_gitlab_api_raw(path: str) -> str | None:
-    """Fetch raw file content from GitLab."""
-    pat = await _get_active_pat()
-    url = f"{settings.gitlab_url.rstrip('/')}/api/v4/{path}"
-    headers = {"PRIVATE-TOKEN": pat}
-    logger.info("Proxying GET RAW to real GitLab: %s", url)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
-        if resp.status_code == 404:
-            return None
-        if resp.status_code >= 400:
-            resp.raise_for_status()
-        return resp.text
+def _mr(iid: int) -> dict[str, Any]:
+    mr = dict(state["mr"])
+    mr["iid"] = iid
+    mr["sha"] = mr.get("head_sha", "")  # REST field name
+    return mr
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FastMCP server
+# MCP tools
 # ──────────────────────────────────────────────────────────────────────────────
 
 mcp = FastMCP("gitlab-local")
@@ -146,98 +97,25 @@ mcp = FastMCP("gitlab-local")
 @mcp.tool()
 async def getMergeRequest(projectId: str, mergeRequestIid: int) -> str:
     """Return MR metadata."""
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        path = f"projects/{encoded_project}/merge_requests/{mergeRequestIid}"
-        try:
-            mr_data = await _call_gitlab_api("GET", path)
-            return json.dumps(mr_data)
-        except Exception as e:
-            logger.error("Failed to proxy getMergeRequest: %s", e)
-            raise
-
-    # Fallback to mock state
-    mr = dict(state["mr"])
-    mr["iid"] = mergeRequestIid
-    return json.dumps(mr)
+    return json.dumps(_mr(mergeRequestIid))
 
 
 @mcp.tool()
 async def getMergeRequestDiff(projectId: str, mergeRequestIid: int) -> str:
     """Return MR diff changes."""
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        path = f"projects/{encoded_project}/merge_requests/{mergeRequestIid}/changes"
-        try:
-            diff_data = await _call_gitlab_api("GET", path)
-            return json.dumps(diff_data)
-        except Exception as e:
-            logger.error("Failed to proxy getMergeRequestDiff: %s", e)
-            raise
-
-    # Fallback to mock state
     return json.dumps(state["diff"])
 
 
 @mcp.tool()
-async def getRepositoryFiles(
-    projectId: str,
-    ref: str,
-    filePaths: list[str] | None = None,
-) -> str:
+async def getRepositoryFiles(projectId: str, ref: str, filePaths: list[str] | None = None) -> str:
     """Return file contents for the requested paths."""
-    paths = filePaths or []
-    result: dict[str, str] = {}
-    
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        for path in paths:
-            encoded_path = urllib.parse.quote_plus(path)
-            api_path = f"projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={ref}"
-            try:
-                content = await _call_gitlab_api_raw(api_path)
-                if content is not None:
-                    result[path] = content
-            except Exception as e:
-                logger.warning("Failed to proxy getRepositoryFiles for %s: %s", path, e)
-        return json.dumps(result)
-
-    # Fallback to mock state
-    for path in paths:
-        content = state["files"].get(path, "")
-        result[path] = content
-    return json.dumps(result)
+    return json.dumps({p: state["files"].get(p, "") for p in filePaths or []})
 
 
 @mcp.tool()
-async def createMergeRequestNote(
-    projectId: str,
-    mergeRequestIid: int,
-    body: str,
-) -> str:
+async def createMergeRequestNote(projectId: str, mergeRequestIid: int, body: str) -> str:
     """Post a comment on an MR. Records the body for test inspection."""
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        path = f"projects/{encoded_project}/merge_requests/{mergeRequestIid}/notes"
-        try:
-            note_data = await _call_gitlab_api("POST", path, {"body": body})
-            return json.dumps(note_data)
-        except Exception as e:
-            logger.error("Failed to proxy createMergeRequestNote: %s", e)
-            raise
-
-    # Fallback to mock state
-    note_id = state["_next_note_id"]
-    state["_next_note_id"] += 1
-    state["comments"].append(
-        {
-            "id": note_id,
-            "body": body,
-            "project_id": projectId,
-            "mr_iid": mergeRequestIid,
-        }
-    )
-    return json.dumps({"id": note_id, "body": body})
+    return json.dumps(_add_comment(projectId, mergeRequestIid, body))
 
 
 @mcp.tool()
@@ -250,56 +128,64 @@ async def createPipelineStatus(
     targetUrl: str = "",
 ) -> str:
     """Set a commit pipeline status. Records the call for test inspection."""
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        path = f"projects/{encoded_project}/statuses/{sha}"
-        payload = {
-            "state": state,
-            "name": name,
-            "description": description,
-        }
-        if targetUrl:
-            payload["target_url"] = targetUrl
-            
-        try:
-            status_data = await _call_gitlab_api("POST", path, payload)
-            return json.dumps(status_data)
-        except Exception as e:
-            logger.error("Failed to proxy createPipelineStatus: %s", e)
-            raise
-
-    # Note: parameter shadowing `state` dict — use a local name
-    import tests.servers.gitlab_mcp_server as _self_module  # type: ignore[import]
-
-    status_record = {
-        "sha": sha,
-        "state": state,
-        "name": name,
-        "description": description,
-    }
-    _self_module.state["pipeline_statuses"].append(status_record)
-    return json.dumps({"id": 9001, "sha": sha, "status": state})
+    return json.dumps(_add_status(sha, state, name, description))
 
 
 @mcp.tool()
-async def updateMergeRequest(
-    projectId: str,
-    mergeRequestIid: int,
-    action: str = "approve",
-) -> str:
+async def updateMergeRequest(projectId: str, mergeRequestIid: int, action: str = "approve") -> str:
     """Approve or request changes on an MR."""
-    if await _is_real_token():
-        encoded_project = urllib.parse.quote_plus(projectId)
-        path = f"projects/{encoded_project}/merge_requests/{mergeRequestIid}/{action}"
-        try:
-            approval_data = await _call_gitlab_api("POST", path)
-            return json.dumps(approval_data)
-        except Exception as e:
-            logger.error("Failed to proxy updateMergeRequest (%s): %s", action, e)
-            raise
-
-    # Fallback to mock state
-    state["approvals"].append(
-        {"mr_iid": mergeRequestIid, "action": action}
-    )
+    state["approvals"].append({"mr_iid": mergeRequestIid, "action": action})
     return json.dumps({"iid": mergeRequestIid, "action": action})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REST v4 routes (subset used by gitlab_tool)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_P = "/api/v4/projects/{project:path}"
+
+
+@mcp.custom_route(_P + "/merge_requests/{iid}", methods=["GET"])
+async def rest_get_mr(request: Request) -> JSONResponse:
+    return JSONResponse(_mr(int(request.path_params["iid"])))
+
+
+@mcp.custom_route(_P + "/merge_requests/{iid}/changes", methods=["GET"])
+async def rest_get_changes(request: Request) -> JSONResponse:
+    return JSONResponse({**_mr(int(request.path_params["iid"])), "changes": state["diff"]})
+
+
+@mcp.custom_route(_P + "/repository/files/{file:path}/raw", methods=["GET"])
+async def rest_get_file(request: Request) -> PlainTextResponse:
+    content = state["files"].get(request.path_params["file"])
+    if content is None:
+        return PlainTextResponse("404 File Not Found", status_code=404)
+    return PlainTextResponse(content)
+
+
+@mcp.custom_route(_P + "/merge_requests/{iid}/notes", methods=["POST"])
+async def rest_post_note(request: Request) -> JSONResponse:
+    body = (await request.json()).get("body", "")
+    note = _add_comment(request.path_params["project"], int(request.path_params["iid"]), body)
+    return JSONResponse(note, status_code=201)
+
+
+@mcp.custom_route(_P + "/statuses/{sha}", methods=["POST"])
+async def rest_post_status(request: Request) -> JSONResponse:
+    data = await request.json()
+    status = _add_status(
+        request.path_params["sha"], data.get("state", ""), data.get("name", ""), data.get("description", "")
+    )
+    return JSONResponse(status, status_code=201)
+
+
+@mcp.custom_route(_P + "/merge_requests/{iid}/approve", methods=["POST"])
+async def rest_approve(request: Request) -> JSONResponse:
+    state["approvals"].append({"mr_iid": int(request.path_params["iid"]), "action": "approve"})
+    return JSONResponse({"iid": int(request.path_params["iid"])}, status_code=201)
+
+
+@mcp.custom_route(_P + "/merge_requests/{iid}/unapprove", methods=["POST"])
+async def rest_unapprove(request: Request) -> JSONResponse:
+    state["approvals"].append({"mr_iid": int(request.path_params["iid"]), "action": "unapprove"})
+    return JSONResponse({"iid": int(request.path_params["iid"])}, status_code=201)

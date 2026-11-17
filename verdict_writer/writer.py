@@ -81,7 +81,7 @@ def format_mr_comment(
 
     # p95 latency
     p95_delta = replay_result.latency_delta_p95_ms
-    p95_status = _latency_status(p95_delta, baseline.slo_latency_budget_p95_ms)
+    p95_status = _latency_status(p95_delta, replay_result.actual_p95_ms, baseline.slo_latency_budget_p95_ms)
     lines.append(
         f"| p95 Latency | {baseline.p95_latency_ms:.0f}ms | "
         f"{replay_result.actual_p95_ms:.0f}ms | "
@@ -93,7 +93,7 @@ def format_mr_comment(
     lines.append(
         f"| p50 Latency | {baseline.p50_latency_ms:.0f}ms | "
         f"{replay_result.actual_p50_ms:.0f}ms | "
-        f"{p50_delta:+.0f}ms | {_latency_status(p50_delta, baseline.slo_latency_budget_p95_ms)} |"
+        f"{p50_delta:+.0f}ms | {_latency_status(p50_delta)} |"
     )
 
     # Error rate
@@ -122,6 +122,13 @@ def format_mr_comment(
         f"{novel_status} |"
     )
     lines.append("")
+
+    # ── Evidence (includes SLO-gate breaches) ──
+    if verdict.evidence:
+        lines.append("### Evidence")
+        lines.append("")
+        lines.extend(f"- {item}" for item in verdict.evidence)
+        lines.append("")
 
     # ── Score breakdown ──
     lines.append("### Score Breakdown")
@@ -154,7 +161,11 @@ def format_mr_comment(
 
     # ── Gemini reasoning ──
     if verdict.recommendation:
-        lines.append("### Gemini Analysis")
+        lines.append(
+            "### Analysis (threshold logic — Gemini unavailable)"
+            if verdict.gemini_model == "deterministic-fallback"
+            else "### Gemini Analysis"
+        )
         lines.append("")
         lines.append(f"**Recommendation:** {verdict.recommendation}")
         lines.append("")
@@ -170,10 +181,15 @@ def format_mr_comment(
             lines.append("|-----------|----------|------------|-------|--------|")
 
             def _arize_row(name: str, baseline_score: float | None, sim_score: float | None, delta: float | None) -> str:
+                # `delta` is signed positive = degradation (see ArizeEvalResult);
+                # the Delta column shows the raw score change for readability.
                 b = f"{baseline_score:.3f}" if baseline_score is not None else "—"
                 s = f"{sim_score:.3f}" if sim_score is not None else "—"
-                d = f"{delta:+.3f}" if delta is not None else "—"
-                status = "✅ Within noise band" if (delta is None or abs(delta) <= 0.10) else "🚫 Regression"
+                if baseline_score is not None and sim_score is not None:
+                    d = f"{sim_score - baseline_score:+.3f}"
+                else:
+                    d = f"{delta:+.3f}" if delta is not None else "—"
+                status = "✅ Within noise band" if (delta is None or delta <= 0.10) else "🚫 Regression"
                 return f"| {name} | {b} | {s} | {d} | {status} |"
 
             lines.append(_arize_row(
@@ -236,14 +252,15 @@ def format_mr_comment(
 # ──────────────────────────────────────────────
 
 
-def _latency_status(delta_ms: float, slo_budget_ms: float) -> str:
-    """Return status emoji and text for a latency delta."""
+def _latency_status(delta_ms: float, actual_ms: float = 0.0, slo_budget_ms: float = 0.0) -> str:
+    """Status for a latency delta; flags an SLO breach when a budget is given."""
     NOISE_FLOOR = 35.0
     if delta_ms <= NOISE_FLOOR:
-        return "✅ Within budget"
-    noise_multiple = delta_ms / NOISE_FLOOR if NOISE_FLOOR > 0 else 0
-    slo_multiple = delta_ms / slo_budget_ms if slo_budget_ms > 0 else 0
-    return f"🚫 {slo_multiple:.1f}x SLO budget ({noise_multiple:.1f}x noise floor)"
+        return "✅ Within noise floor"
+    status = f"🚫 {delta_ms / NOISE_FLOOR:.1f}x noise floor"
+    if slo_budget_ms and actual_ms > slo_budget_ms:
+        status += f", over {slo_budget_ms:.0f}ms SLO"
+    return status
 
 
 def _error_rate_status(delta_percent: float) -> str:
@@ -286,6 +303,7 @@ async def enforce_verdict(
     replay_result: ReplayResult | None,
     baseline: ServiceBaseline,
     arize_result: ArizeEvalResult | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     Post verdict to GitLab and set pipeline status gate.
@@ -296,9 +314,12 @@ async def enforce_verdict(
     3. Set Bulwark/production-ready pipeline status (success/failed)
     4. Approve or request changes on the MR (if PAT has approval rights)
     5. Persist results to MongoDB
+
+    dry_run (local demo scenarios): steps 2–4 are skipped — the comment and
+    pipeline state are only persisted, nothing is sent to GitLab.
     """
     from orchestrator.tools.gitlab_tool import post_mr_comment, set_pipeline_status, update_mr_approval
-    from shared.db import update_simulation
+    from shared.db import save_verdict, update_simulation
 
     if replay_result is None:
         from shared.models import ReplayResult as RR
@@ -313,15 +334,6 @@ async def enforce_verdict(
         arize_result=arize_result,
     )
 
-    # Step 1+2: Post MR comment
-    comment_id = None
-    try:
-        comment_id = await post_mr_comment(project_id, mr_id, comment_body)
-        logger.info("Posted verdict comment on MR !%d: note_id=%s", mr_id, comment_id)
-    except Exception as e:
-        logger.error("Failed to post MR comment: %s", e)
-
-    # Step 3: Set pipeline status
     pipeline_state = "success" if verdict.verdict in (VerdictStatus.APPROVED, VerdictStatus.WARNING) else "failed"
     pipeline_description = {
         VerdictStatus.APPROVED: f"APPROVED — {verdict.overall_score}/100 confidence",
@@ -329,37 +341,52 @@ async def enforce_verdict(
         VerdictStatus.BLOCKED: f"BLOCKED — {verdict.overall_score}/100 confidence (regression detected)",
     }[verdict.verdict]
 
-    try:
-        await set_pipeline_status(
-            project_id=project_id,
-            sha=head_sha,
-            state=pipeline_state,
-            description=pipeline_description,
-        )
-        logger.info(
-            "Pipeline status: %s (%s) for sha %s",
-            pipeline_state,
-            pipeline_description,
-            head_sha[:8],
-        )
-    except Exception as e:
-        logger.error("Failed to set pipeline status: %s", e)
+    comment_id = None
+    if dry_run:
+        logger.info("Dry run — verdict comment not posted to GitLab (pipeline would be %s)", pipeline_state)
+    else:
+        # Step 1+2: Post MR comment
+        try:
+            comment_id = await post_mr_comment(project_id, mr_id, comment_body)
+            logger.info("Posted verdict comment on MR !%d: note_id=%s", mr_id, comment_id)
+        except Exception as e:
+            logger.error("Failed to post MR comment: %s", e)
 
-    # Step 4: Approve or request changes (best-effort)
-    try:
-        if verdict.verdict == VerdictStatus.APPROVED:
-            await update_mr_approval(project_id, mr_id, approve=True)
-        elif verdict.verdict == VerdictStatus.BLOCKED:
-            await update_mr_approval(project_id, mr_id, approve=False)
-    except Exception as e:
-        logger.warning("MR approval update failed (non-critical): %s", e)
+        # Step 3: Set pipeline status
+        try:
+            await set_pipeline_status(
+                project_id=project_id,
+                sha=head_sha,
+                state=pipeline_state,
+                description=pipeline_description,
+            )
+            logger.info(
+                "Pipeline status: %s (%s) for sha %s",
+                pipeline_state,
+                pipeline_description,
+                head_sha[:8],
+            )
+        except Exception as e:
+            logger.error("Failed to set pipeline status: %s", e)
 
-    # Step 5: Persist to MongoDB
+        # Step 4: Approve or request changes (best-effort)
+        try:
+            if verdict.verdict == VerdictStatus.APPROVED:
+                await update_mr_approval(project_id, mr_id, approve=True)
+            elif verdict.verdict == VerdictStatus.BLOCKED:
+                await update_mr_approval(project_id, mr_id, approve=False)
+        except Exception as e:
+            logger.warning("MR approval update failed (non-critical): %s", e)
+
+    # Step 5: Persist to MongoDB (simulation record + verdicts collection)
+    verdict_doc = verdict.model_dump(mode="json")
     try:
         await update_simulation(simulation_id, {
-            "verdict": verdict.model_dump(mode="json"),
+            "verdict": verdict_doc,
             "gitlab.comment_id": comment_id,
+            "gitlab.comment_body": comment_body,
             "gitlab.pipeline_status": pipeline_state,
         })
+        await save_verdict(simulation_id, dict(verdict_doc))
     except Exception as e:
         logger.error("Failed to persist verdict to MongoDB: %s", e)

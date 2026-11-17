@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import statistics
 import time
 from typing import Any
 
@@ -257,6 +256,17 @@ async def replay_traffic(
             max_keepalive_connections=concurrency,
         ),
     ) as client:
+        # Warm-up burst (discarded): a fresh instance pays cold start, lazy imports
+        # and connection setup on its first requests. At n=200 the first burst of
+        # `concurrency` requests *is* the p95, so measuring it would report a
+        # regression on unchanged code.
+        warmup = requests[:concurrency]
+        await asyncio.gather(*[
+            _replay_single_request(client, environment.base_url, req, semaphore)
+            for req in warmup
+        ])
+        replay_start = time.time()
+
         tasks = [
             _replay_single_request(client, environment.base_url, req, semaphore)
             for req in requests

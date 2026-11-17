@@ -131,6 +131,29 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
 # ──────────────────────────────────────────────
 
 
+def new_simulation_doc(message: Any) -> dict[str, Any]:
+    """Initial `simulations` record for a queued MR event (an MREventMessage)."""
+    return {
+        "_id": message.simulation_id,
+        "mr_id": message.mr_id,
+        "project_id": message.project_id,
+        "head_sha": message.head_sha,
+        "source_branch": message.source_branch,
+        "target_branch": message.target_branch,
+        "demo_scenario": message.demo_scenario,
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc),
+        "completed_at": None,
+        "total_duration_ms": 0,
+        "environment": None,
+        "dynatrace": {},
+        "arize": {},
+        "verdict": None,
+        "gitlab": {},
+        "error_log": [],
+    }
+
+
 @with_mongo_retry()
 async def create_simulation(simulation: dict[str, Any]) -> str:
     """Insert a new simulation record. Returns the simulation_id."""
@@ -182,10 +205,13 @@ async def simulation_exists_by_sha(mr_id: int, head_sha: str) -> bool:
 
 
 @with_mongo_retry()
-async def cancel_in_progress_simulation(mr_id: int, new_head_sha: str) -> int:
+async def cancel_in_progress_simulation(
+    mr_id: int, new_head_sha: str, project_id: str | None = None
+) -> int:
     """
     Cancel any in-progress simulations for this MR that have a different head_sha.
     Called when a new push arrives on the same MR (FR-023).
+    MR iids are per-project, so pass project_id to avoid cancelling another repo's MR.
     Returns the count of cancelled simulations.
     """
     db = await get_database()
@@ -193,12 +219,15 @@ async def cancel_in_progress_simulation(mr_id: int, new_head_sha: str) -> int:
         "queued", "ingesting", "fetching_baseline",
         "provisioning", "replaying", "evaluating", "reasoning", "enforcing",
     ]
+    query: dict[str, Any] = {
+        "mr_id": mr_id,
+        "head_sha": {"$ne": new_head_sha},
+        "status": {"$in": in_progress_statuses},
+    }
+    if project_id:
+        query["project_id"] = project_id
     result = await db["simulations"].update_many(
-        {
-            "mr_id": mr_id,
-            "head_sha": {"$ne": new_head_sha},
-            "status": {"$in": in_progress_statuses},
-        },
+        query,
         {
             "$set": {
                 "status": "cancelled",
@@ -237,7 +266,8 @@ async def get_historical_context(service_name: str, limit: int = 5) -> list[dict
     cursor = (
         db["simulations"]
         .find(
-            {"service_name": service_name, "status": "completed"},
+            # Doc-only skips and deferred runs complete without a verdict — exclude them
+            {"service_name": service_name, "status": "completed", "verdict": {"$ne": None}},
             # Project only the fields Gemini needs — keep context window tight
             {
                 "_id": 1,
@@ -401,28 +431,3 @@ async def save_gitlab_pat(pat: str) -> None:
         {"_id": "gitlab", "pat": pat},
         upsert=True,
     )
-
-
-@with_mongo_retry()
-async def get_demo_mode() -> bool:
-    """Fetch the active demo mode flag from MongoDB, falling back to environment settings."""
-    try:
-        db = await get_database()
-        doc = await db["settings"].find_one({"_id": "demo_mode"})
-        if doc and "active" in doc:
-            return doc["active"]
-    except Exception:
-        pass
-    return settings.bulwark_demo_mode
-
-
-@with_mongo_retry()
-async def save_demo_mode(active: bool) -> None:
-    """Save the active demo mode flag to MongoDB."""
-    db = await get_database()
-    await db["settings"].replace_one(
-        {"_id": "demo_mode"},
-        {"_id": "demo_mode", "active": active},
-        upsert=True,
-    )
-

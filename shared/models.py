@@ -148,6 +148,7 @@ class ServiceDependency(BaseModel):
     name: str
     base_url: str
     endpoints: list[str] = Field(default_factory=list)
+    latency_ms: int = 0  # observed response time; WireMock stubs replay it as a fixed delay
 
 
 class ServiceTopology(BaseModel):
@@ -170,7 +171,10 @@ class ArizeEvalResult(BaseModel):
     """
 
     llm_detected: bool = False
-    # Deltas vs production baseline (positive = regression)
+    # Deltas vs production baseline, signed so that positive = regression:
+    #   hallucination_delta = sim - baseline   (more hallucination is worse)
+    #   relevance_delta     = baseline - sim   (less relevance is worse)
+    #   groundedness_delta  = baseline - sim   (less grounding is worse)
     hallucination_delta: float | None = None
     relevance_delta: float | None = None
     groundedness_delta: float | None = None
@@ -218,6 +222,7 @@ class WireMockStub(BaseModel):
     response_headers: dict[str, str] = Field(
         default_factory=lambda: {"Content-Type": "application/json"}
     )
+    fixed_delay_ms: int = 0
 
 
 class EnvironmentConfig(BaseModel):
@@ -311,6 +316,7 @@ class GitLabEnforcement(BaseModel):
     """Record of what was posted back to GitLab."""
 
     comment_id: int | None = None
+    comment_body: str = ""  # rendered MR comment (also kept for dry runs)
     pipeline_status: str = ""  # success | failed
     override_applied: bool = False
     override_author: str | None = None
@@ -373,6 +379,9 @@ class MREventMessage(BaseModel):
     target_branch: str
     mr_url: str = ""
     received_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Set only for local demo scenarios ("regression" | "fixed" | "llm-regression"):
+    # the MR is synthetic, so GitLab is not called (dry run).
+    demo_scenario: str = ""
 
 
 # ──────────────────────────────────────────────

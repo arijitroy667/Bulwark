@@ -10,6 +10,8 @@ COPY orchestrator/ ./orchestrator/
 COPY environment_builder/ ./environment_builder/
 COPY traffic_replay/ ./traffic_replay/
 COPY verdict_writer/ ./verdict_writer/
+# Demo mode launches demo-app as a local subprocess (the ephemeral environment)
+COPY demo-app/ ./demo-app/
 
 EXPOSE 8080
 

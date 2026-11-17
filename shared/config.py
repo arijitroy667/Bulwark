@@ -8,6 +8,8 @@ Google Cloud Secret Manager.
 
 from __future__ import annotations
 
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,7 +17,9 @@ class BulwarkSettings(BaseSettings):
     """Application-wide configuration. Values are read from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Tests set BULWARK_ENV_FILE to a missing path so a developer's .env
+        # (real tokens, real URLs) never leaks into them.
+        env_file=os.environ.get("BULWARK_ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -60,6 +64,8 @@ class BulwarkSettings(BaseSettings):
     # --- Bulwark Settings ---
     bulwark_mode: str = "development"  # development | production
     bulwark_demo_mode: bool = False    # Run in demo mode (bypass real GCP/Dynatrace)
+    # Local WireMock used by demo mode (docker-compose maps it to :8082)
+    wiremock_base_url: str = "http://localhost:8082"
     simulation_timeout_seconds: int = 900  # 15 minutes hard ceiling (PRD §12.1)
     replay_concurrency: int = 10  # Default: 10× concurrent replay (FR-011)
     replay_request_limit: int = 200  # Max production request samples (FR-007)

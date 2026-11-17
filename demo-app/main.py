@@ -6,11 +6,13 @@ This is a minimal FastAPI service used to demonstrate Bulwark's core value:
 catching a performance regression *before* it reaches production.
 
 PRD §18 scenario:
-  - v1 (regression): GET /users makes one DB call per user (classic N+1)
-  - v2 (fixed):      GET /users makes a single batched call
+  - regression: GET /users makes one preferences call per user (classic N+1)
+  - fixed:      GET /users makes a single batched call
+  - llm-regression: the ticket-summary prompt is edited and starts over-promising
 
-The N+1 pattern produces a +187ms p95 latency delta against a 142ms baseline
-when replayed with 200 production requests — well above the ±35ms noise floor.
+Each preferences call is a WireMock round trip (Bulwark gives the stub a fixed
+delay, standing in for a DB query), so the N+1 version's latency grows with the
+number of users — 25 serial round trips instead of one.
 
 To run locally (regression version):
     DEMO_VERSION=regression uvicorn main:app --port 8080
@@ -24,11 +26,12 @@ In Bulwark simulations this is automatically set to the ephemeral WireMock URL.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -40,15 +43,14 @@ logger = logging.getLogger("demo_app")
 # Configuration
 # ──────────────────────────────────────────────
 
-# Set DEMO_VERSION=regression to enable the N+1 bug (for demo BLOCKED branch)
-# Set DEMO_VERSION=fixed (default) for the APPROVED branch
+# DEMO_VERSION selects which "commit" this process runs:
+#   fixed (default)  — production code: batched preferences, original prompt
+#   regression       — N+1 preferences lookup (demo BLOCKED branch)
+#   llm-regression   — batched preferences, edited ticket-summary prompt
 DEMO_VERSION: str = os.getenv("DEMO_VERSION", "fixed")
 
 # WireMock base URL — points to the ephemeral WireMock stub in Bulwark simulations
 WIREMOCK_BASE_URL: str = os.getenv("WIREMOCK_BASE_URL", "http://localhost:8082")
-
-# Simulated DB latency (ms) — represents realistic ORM round-trip
-SIMULATED_DB_LATENCY_MS: float = float(os.getenv("SIMULATED_DB_LATENCY_MS", "12"))
 
 # ──────────────────────────────────────────────
 # Mock data (represents what would come from a real DB)
@@ -73,7 +75,20 @@ async def lifespan(app: FastAPI):
         WIREMOCK_BASE_URL,
     )
     yield
+    if _client is not None:
+        await _client.aclose()
     logger.info("Demo app shutting down")
+
+
+# One pooled client for the preferences service, as a real service would use.
+_client: httpx.AsyncClient | None = None
+
+
+def _preferences_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(base_url=WIREMOCK_BASE_URL, timeout=httpx.Timeout(5.0))
+    return _client
 
 
 # ──────────────────────────────────────────────
@@ -114,12 +129,10 @@ async def get_users(request: Request) -> JSONResponse:
 
     REGRESSION version (DEMO_VERSION=regression):
         Makes one HTTP call per user to fetch preferences — O(n) calls.
-        With 25 users × ~12ms DB latency = ~300ms total serial latency.
-        This produces a +187ms p95 delta against the 142ms baseline.
+        With 25 users × ~12ms round trip ≈ 300ms of serial latency.
 
     FIXED version (DEMO_VERSION=fixed):
-        Makes a single batched call to fetch all preferences at once.
-        Total latency: ~12ms + response overhead ≈ 3ms p95 delta.
+        Makes a single batched call to fetch all preferences at once (~12ms).
     """
     start = time.perf_counter()
 
@@ -153,20 +166,17 @@ async def _get_users_n_plus_one() -> list[dict]:
             prefs = db.query(f"SELECT * FROM preferences WHERE user_id = {user.id}")
     """
     users_with_prefs = []
-    async with httpx.AsyncClient(
-        base_url=WIREMOCK_BASE_URL,
-        timeout=httpx.Timeout(5.0),
-    ) as client:
-        for user in MOCK_USERS:
-            try:
-                # One HTTP call per user — simulates N+1 DB query pattern
-                resp = await client.get(f"/api/preferences/{user['id']}")
-                prefs = resp.json() if resp.status_code == 200 else {}
-            except Exception as e:
-                logger.warning("Failed to fetch prefs for user %d: %s", user["id"], e)
-                prefs = {}
+    client = _preferences_client()
+    for user in MOCK_USERS:
+        try:
+            # One HTTP call per user — simulates N+1 DB query pattern
+            resp = await client.get(f"/api/preferences/{user['id']}")
+            prefs = resp.json() if resp.status_code == 200 else {}
+        except Exception as e:
+            logger.warning("Failed to fetch prefs for user %d: %s", user["id"], e)
+            prefs = {}
 
-            users_with_prefs.append({**user, "preferences": prefs})
+        users_with_prefs.append({**user, "preferences": prefs})
 
     return users_with_prefs
 
@@ -185,17 +195,13 @@ async def _get_users_batched() -> list[dict]:
         )
     """
     prefs_map: dict = {}
-    async with httpx.AsyncClient(
-        base_url=WIREMOCK_BASE_URL,
-        timeout=httpx.Timeout(5.0),
-    ) as client:
-        try:
-            # Single batch call — simulates a JOIN or IN-clause query
-            resp = await client.get("/api/preferences/batch")
-            if resp.status_code == 200:
-                prefs_map = resp.json()
-        except Exception as e:
-            logger.warning("Batch preferences fetch failed: %s", e)
+    try:
+        # Single batch call — simulates a JOIN or IN-clause query
+        resp = await _preferences_client().get("/api/preferences/batch")
+        if resp.status_code == 200:
+            prefs_map = resp.json()
+    except Exception as e:
+        logger.warning("Batch preferences fetch failed: %s", e)
 
     return [
         {**user, "preferences": prefs_map.get(str(user["id"]), {})}
@@ -228,40 +234,75 @@ async def get_metrics() -> dict:
 
 
 # ──────────────────────────────────────────────
-# /traces — LLM Observability Endpoint (PRD §6.3)
+# LLM-backed endpoint + /traces (PRD §6.3)
 # ──────────────────────────────────────────────
+
+PROMPT_DIR = Path(__file__).parent / "prompts"
+# Production prompt lives in prompts/ticket_summary.prompt; the llm-regression
+# "commit" edits it to the version below.
+PROMPT_EDITED = (
+    "Write a warm, engaging summary of the support ticket below.\n"
+    "Reassure the customer and tell them exactly what we will do to make it right.\n"
+    "Ticket: {ticket}"
+)
+
+TICKETS = {
+    1: {"customer": "Priya", "order": "A-1001", "issue": "the headphones arrived with a cracked case", "request": "a replacement"},
+    2: {"customer": "Marcus", "order": "A-1002", "issue": "the card was charged twice", "request": "a refund of the duplicate charge"},
+    3: {"customer": "Elena", "order": "A-1003", "issue": "the package has not arrived after 10 days", "request": "a delivery update"},
+    4: {"customer": "Tom", "order": "A-1004", "issue": "the account is locked after a password reset", "request": "help getting back into the account"},
+    5: {"customer": "Aisha", "order": "A-1005", "issue": "the jacket was delivered in the wrong size", "request": "an exchange for size M"},
+}
+
+# Traces captured while serving traffic; Bulwark reads them after replay.
+TRACE_BUFFER: deque = deque(maxlen=500)
+
+
+def _ticket_text(t: dict) -> str:
+    return f"Customer {t['customer']}, order {t['order']}: {t['issue']}. Requested: {t['request']}."
+
+
+def _prompt_template() -> str:
+    if DEMO_VERSION == "llm-regression":
+        return PROMPT_EDITED
+    return (PROMPT_DIR / "ticket_summary.prompt").read_text(encoding="utf-8").strip()
+
+
+def _stand_in_llm(t: dict) -> str:
+    """Deterministic stand-in for the model call, so simulations are reproducible.
+
+    The original prompt yields a faithful summary; the edited "reassure the
+    customer" prompt yields the kind of over-promising answer it produces in
+    practice (refunds, discounts and timelines that the ticket never mentions).
+    """
+    if DEMO_VERSION == "llm-regression":
+        return (
+            f"Great news, {t['customer']}! We have already approved a full refund for order "
+            f"{t['order']}, added a 25% discount to your account and upgraded you to free "
+            f"express shipping. Everything will be resolved within 24 hours."
+        )
+    return f"{t['customer']} reports that on order {t['order']} {t['issue']}, and is asking for {t['request']}."
+
+
+@app.get("/tickets/{ticket_id}/summary")
+async def summarize_ticket(ticket_id: int) -> dict:
+    """LLM-backed summary of a support ticket (records a trace per call)."""
+    ticket = TICKETS.get(ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail=f"Ticket {ticket_id} not found")
+    context = _ticket_text(ticket)
+    prompt = _prompt_template().format(ticket=context)
+    summary = _stand_in_llm(ticket)
+    TRACE_BUFFER.append({
+        "prompt": prompt,
+        "response": summary,
+        "context": context,
+        "model": "stand-in-llm",
+    })
+    return {"ticket_id": ticket_id, "summary": summary}
 
 
 @app.get("/traces")
 async def get_traces() -> dict:
-    """
-    Exposes LLM traces captured during the simulation.
-    Bulwark's orchestrator calls this at the end of the replay phase
-    to gather spans for Arize evaluation.
-    
-    In the real world, this would be backed by an in-memory buffer,
-    Redis, or a trace collector sink within the ephemeral environment.
-    """
-    if DEMO_VERSION != "llm-demo":
-        # Only return traces in the LLM demo scenario
-        return {"traces": []}
-
-    # Simulate traces captured during traffic replay
-    return {
-        "traces": [
-            {
-                "prompt": "Summarize this ticket: T-1234. Customer is asking for a refund.",
-                "response": "The customer requested a refund for ticket T-1234.",
-                "context": {"ticket_id": "T-1234", "user_tier": "premium"},
-                "model": "gemini-1.5-flash",
-                "latency_ms": 450,
-            },
-            {
-                "prompt": "Write a polite rejection email for feature request F-99.",
-                "response": "Thank you for the suggestion. Unfortunately, we cannot build F-99 right now.",
-                "context": {"feature_id": "F-99"},
-                "model": "gemini-1.5-flash",
-                "latency_ms": 380,
-            },
-        ]
-    }
+    """LLM traces captured while serving traffic (read by Bulwark after replay)."""
+    return {"traces": list(TRACE_BUFFER)}

@@ -18,6 +18,7 @@ captured spans and real Arize API responses.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -147,27 +148,126 @@ async def get_llm_baseline(service_name: str) -> dict[str, Any]:
     }
 
 
+# ──────────────────────────────────────────────
+# Evaluators (hallucination / relevance / groundedness)
+# ──────────────────────────────────────────────
+#
+# The official Phoenix MCP server can store datasets but cannot *run*
+# evaluators, so Bulwark runs the three Arize/Phoenix LLM-as-judge evaluators
+# itself, with Gemini as the judge model.
+
+JUDGE_MAX_RECORDS = 20
+
+_JUDGE_PROMPT = """You are an LLM-output evaluator implementing the Arize/Phoenix
+hallucination, relevance and groundedness evaluators.
+
+For every record, the CONTEXT holds the only facts that are known. Judge the RESPONSE:
+- hallucination: 1 if the response states anything not supported by the CONTEXT
+  (invented facts, amounts, promises, timelines), otherwise 0.
+- relevance: 0.0-1.0, how well the response does what the PROMPT asks.
+- groundedness: 0.0-1.0, the fraction of the response's claims supported by the CONTEXT.
+
+Return strict JSON: {{"scores": [{{"id": <record id>, "hallucination": 0 or 1,
+"relevance": <float>, "groundedness": <float>}}]}}
+
+Records:
+{records}"""
+
+
+async def judge_llm_outputs(outputs: list[dict[str, Any]]) -> dict[str, float] | None:
+    """Score LLM outputs with the three evaluators. Returns mean scores, or None
+    if the judge is unavailable or its answer is unusable."""
+    from orchestrator.reasoning import _call_gemini
+    from shared.config import settings
+
+    if not settings.gemini_api_key:
+        return None
+
+    # Replayed traffic repeats requests; judge each distinct output once.
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for out in outputs:
+        unique.setdefault((str(out.get("prompt", "")), str(out.get("response", ""))), out)
+    records = list(unique.values())[:JUDGE_MAX_RECORDS]
+    text = "\n\n".join(
+        f"[{i}] PROMPT: {r.get('prompt', '')}\nCONTEXT: {r.get('context') or 'none'}\nRESPONSE: {r.get('response', '')}"
+        for i, r in enumerate(records)
+    )
+    try:
+        data = await _call_gemini(_JUDGE_PROMPT.format(records=text))
+        rows = [s for s in data.get("scores", []) if isinstance(s, dict)]
+        if not rows:
+            return None
+
+        def _mean(key: str) -> float:
+            return sum(float(s.get(key, 0) or 0) for s in rows) / len(rows)
+
+        return {
+            "hallucination": round(_mean("hallucination"), 3),
+            "relevance": round(_mean("relevance"), 3),
+            "groundedness": round(_mean("groundedness"), 3),
+            "count": len(rows),
+        }
+    except Exception as exc:
+        logger.warning("LLM evaluator call failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+
+def _eval_result(
+    sim: dict[str, float],
+    base: dict[str, float],
+    started: float,
+    **extra: Any,
+) -> ArizeEvalResult:
+    """Deltas signed so positive = degradation (see ArizeEvalResult)."""
+    return ArizeEvalResult(
+        llm_detected=True,
+        hallucination_delta=round(sim["hallucination"] - base["hallucination"], 3),
+        relevance_delta=round(base["relevance"] - sim["relevance"], 3),
+        groundedness_delta=round(base["groundedness"] - sim["groundedness"], 3),
+        sim_hallucination_score=sim["hallucination"],
+        sim_relevance_score=sim["relevance"],
+        sim_groundedness_score=sim["groundedness"],
+        baseline_hallucination_score=base["hallucination"],
+        baseline_relevance_score=base["relevance"],
+        baseline_groundedness_score=base["groundedness"],
+        eval_duration_ms=int((time.time() - started) * 1000),
+        **extra,
+    )
+
+
+async def evaluate_against_traces(
+    simulation_outputs: list[dict[str, Any]],
+    baseline_outputs: list[dict[str, Any]],
+) -> ArizeEvalResult:
+    """Evaluate simulation outputs against production outputs (both judged now)."""
+    started = time.time()
+    if not simulation_outputs:
+        return ArizeEvalResult(llm_detected=True, skip_reason="No LLM traces captured during simulation (/traces empty)")
+    if not baseline_outputs:
+        return ArizeEvalResult(llm_detected=True, skip_reason="No production LLM traces available as a baseline")
+    sim, base = await asyncio.gather(judge_llm_outputs(simulation_outputs), judge_llm_outputs(baseline_outputs))
+    if sim is None or base is None:
+        return ArizeEvalResult(
+            llm_detected=True,
+            skip_reason="LLM evaluators unavailable (Gemini judge not configured or failed)",
+        )
+    return _eval_result(sim, base, started)
+
+
 async def run_eval(
     simulation_id: str,
     simulation_outputs: list[dict[str, Any]],
     baseline_dataset_id: str | None,
+    baseline_scores: dict[str, Any] | None = None,
 ) -> ArizeEvalResult:
     """
-    Submit simulation LLM outputs to Arize via MCP for evaluation.
+    Evaluate simulation LLM outputs against the Arize production baseline.
 
-    Since @arizeai/phoenix-mcp does not provide a synchronous `runEval` tool,
-    we push the simulation outputs as examples to the simulation dataset,
-    and return the eval result indicating that synchronous evaluation is unsupported.
-
-    Args:
-        simulation_id: The simulation identifier (used for Arize dataset naming).
-        simulation_outputs: List of {prompt, response, context} dicts from simulation.
-        baseline_dataset_id: Arize dataset ID of the production baseline.
-
-    Returns:
-        ArizeEvalResult with score deltas and metadata.
+    1. Archive the outputs as examples in a Phoenix dataset (best effort).
+    2. Score them with the hallucination / relevance / groundedness evaluators.
+    3. Compare with the baseline experiment scores from get_llm_baseline().
     """
-    start_time = time.time()
+    started = time.time()
 
     if not simulation_outputs:
         return ArizeEvalResult(
@@ -175,66 +275,60 @@ async def run_eval(
             skip_reason="No LLM outputs captured during simulation",
         )
 
-    logger.info(
-        "Adding %d simulation outputs as examples to Arize (sim: %s)",
-        len(simulation_outputs),
-        simulation_id,
-    )
-
+    dataset_name = f"bulwark-sim-{simulation_id}"
+    logged = False
     try:
-        dataset_name = f"bulwark-sim-{simulation_id}"
-        examples = []
-        for out in simulation_outputs:
-            examples.append({
-                "input": {"prompt": out.get("prompt", "")},
-                "output": {"response": out.get("response", "")},
-                "metadata": {"simulation_id": simulation_id}
-            })
-
-        # 1. Log spans / add examples to a simulation dataset in Arize
         await call_tool(
             MCPServer.ARIZE,
             "add-dataset-examples",
             {
                 "dataset_name": dataset_name,
-                "examples": examples,
+                "examples": [
+                    {
+                        "input": {"prompt": out.get("prompt", "")},
+                        "output": {"response": out.get("response", "")},
+                        "metadata": {"simulation_id": simulation_id},
+                    }
+                    for out in simulation_outputs
+                ],
             },
         )
-        sim_dataset_id = dataset_name # Using name as identifier for simplicity since we can't easily fetch the ID immediately
-
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        return ArizeEvalResult(
-            llm_detected=True,
-            hallucination_delta=None,
-            relevance_delta=None,
-            groundedness_delta=None,
-            sim_hallucination_score=None,
-            sim_relevance_score=None,
-            sim_groundedness_score=None,
-            baseline_hallucination_score=None,
-            baseline_relevance_score=None,
-            baseline_groundedness_score=None,
-            eval_dataset_id=sim_dataset_id,
-            baseline_dataset_id=baseline_dataset_id,
-            eval_duration_ms=duration_ms,
-            skip_reason="Synchronous evaluation and dataset comparison is unsupported by official Phoenix MCP."
-        )
-
+        logged = True
     except MCPConfigError:
         raise
-    except MCPCallError as exc:
-        logger.error("Arize MCP eval error: %s", exc)
-        return ArizeEvalResult(
-            llm_detected=True,
-            skip_reason=f"Arize MCP error: {exc}",
-        )
     except Exception as exc:
-        logger.error("Arize eval failed: %s", exc)
+        logger.warning("Arize dataset ingestion failed (continuing with evaluation): %s", exc)
+
+    meta = {
+        "eval_dataset_id": dataset_name if logged else None,
+        "baseline_dataset_id": baseline_dataset_id,
+        "arize_span_logged": logged,
+    }
+    sim = await judge_llm_outputs(simulation_outputs)
+    if sim is None:
         return ArizeEvalResult(
             llm_detected=True,
-            skip_reason=f"Arize evaluation failed: {exc}",
+            skip_reason="LLM evaluators unavailable (Gemini judge not configured or failed)",
+            **meta,
         )
+
+    if not baseline_scores or not baseline_scores.get("span_count"):
+        return ArizeEvalResult(
+            llm_detected=True,
+            sim_hallucination_score=sim["hallucination"],
+            sim_relevance_score=sim["relevance"],
+            sim_groundedness_score=sim["groundedness"],
+            eval_duration_ms=int((time.time() - started) * 1000),
+            skip_reason="No scored production baseline experiment in Arize for this service",
+            **meta,
+        )
+
+    base = {
+        "hallucination": float(baseline_scores.get("hallucination_score", 0.0)),
+        "relevance": float(baseline_scores.get("relevance_score", 0.0)),
+        "groundedness": float(baseline_scores.get("groundedness_score", 0.0)),
+    }
+    return _eval_result(sim, base, started, **meta)
 
 
 async def log_spans(simulation_id: str, traces: list[dict[str, Any]]) -> bool:

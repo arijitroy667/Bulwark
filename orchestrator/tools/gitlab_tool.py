@@ -29,6 +29,8 @@ def _api_url(path: str) -> str:
     return f"{settings.gitlab_url.rstrip('/')}/api/v4{path}"
 
 def _get_headers() -> dict[str, str]:
+    # ponytail: reads the env PAT; the dashboard /api/setup PAT (stored in Mongo) is only
+    # used by the archive fetch — make this async + get_gitlab_pat() if both must match.
     return {"PRIVATE-TOKEN": settings.gitlab_pat}
 
 async def get_mr_details(project_id: str, mr_id: int) -> MergeRequestDetails:
@@ -200,8 +202,14 @@ def is_doc_only_mr(changed_files: list[str]) -> bool:
         return False
     return True
 
+DIFF_SUMMARY_MAX_CHARS = 6000  # keeps the Gemini context window tight
+
+
 def generate_diff_summary(diffs: list[FileDiff]) -> str:
+    """File list with line counts, followed by the (truncated) diff hunks so
+    Gemini can relate novel errors to the actual code change (PRD §7)."""
     summary_parts = []
+    hunks: list[str] = []
     for diff in diffs:
         action = "Modified"
         if diff.new_file:
@@ -215,8 +223,16 @@ def generate_diff_summary(diffs: list[FileDiff]) -> str:
         deletions = len(re.findall(r"^-(?!--)", diff.diff, re.MULTILINE))
 
         summary_parts.append(f"- {action}: `{diff.new_path}` (+{additions}/-{deletions} lines)")
+        if diff.diff:
+            hunks.append(f"--- {diff.new_path}\n{diff.diff.rstrip()}")
 
-    return "\n".join(summary_parts)
+    summary = "\n".join(summary_parts)
+    if hunks:
+        body = "\n".join(hunks)
+        if len(body) > DIFF_SUMMARY_MAX_CHARS:
+            body = body[:DIFF_SUMMARY_MAX_CHARS] + "\n... (diff truncated)"
+        summary += f"\n\n```diff\n{body}\n```"
+    return summary
 
 async def _find_file_in_repo(project_id: str, ref: str, filename: str) -> str | None:
     content = await get_file_content(project_id, ref, filename)

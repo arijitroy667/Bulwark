@@ -1,7 +1,8 @@
 # ============================================================
 # Bulwark — Docker Compose (Local Development)
 # ============================================================
-# Start the full development stack with: docker-compose up
+# Start the full local stack with: docker compose up --build
+# Then: python scripts/run_demo.py   (or the dashboard: npm run dev --prefix dashboard)
 # ============================================================
 
 services:
@@ -43,7 +44,8 @@ services:
     ports:
       - "8080:8080"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - BULWARK_MODE=development
       - MONGODB_URI=mongodb://mongodb:27017
@@ -58,59 +60,30 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── Orchestrator (dev mode — polls MongoDB queue) ──
+  # ── Orchestrator: dashboard API + MongoDB queue consumer + demo-mode simulations ──
+  # Demo mode runs the local demo-app as the ephemeral environment against the
+  # WireMock above, so the full pipeline works without GCP/Dynatrace accounts.
   orchestrator:
     build:
       context: .
       dockerfile: orchestrator/Dockerfile
     container_name: bulwark-orchestrator
-    command: ["python", "-m", "orchestrator.agent"]
+    ports:
+      - "8000:8080"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - BULWARK_MODE=development
+      - BULWARK_DEMO_MODE=true
       - MONGODB_URI=mongodb://mongodb:27017
       - MONGODB_DB_NAME=bulwark
-      - PYTHONPATH=/app
+      - WIREMOCK_BASE_URL=http://wiremock:8080
     depends_on:
       mongodb:
         condition: service_healthy
-      webhook-receiver:
+      wiremock:
         condition: service_healthy
-
-  # ── Local FastMCP Test Servers ──
-  gitlab-mcp:
-    build:
-      context: .
-      dockerfile: orchestrator/Dockerfile
-    container_name: bulwark-gitlab-mcp
-    command: ["uvicorn", "tests.servers.gitlab_mcp_server:mcp.streamable_http_app", "--host", "0.0.0.0", "--port", "8001"]
-    ports:
-      - "8001:8001"
-    environment:
-      - PYTHONPATH=/app
-
-  dynatrace-mcp:
-    build:
-      context: .
-      dockerfile: orchestrator/Dockerfile
-    container_name: bulwark-dynatrace-mcp
-    command: ["uvicorn", "tests.servers.dynatrace_mcp_server:mcp.streamable_http_app", "--host", "0.0.0.0", "--port", "8002"]
-    ports:
-      - "8002:8002"
-    environment:
-      - PYTHONPATH=/app
-
-  arize-mcp:
-    build:
-      context: .
-      dockerfile: orchestrator/Dockerfile
-    container_name: bulwark-arize-mcp
-    command: ["uvicorn", "tests.servers.arize_mcp_server:mcp.streamable_http_app", "--host", "0.0.0.0", "--port", "8003"]
-    ports:
-      - "8003:8003"
-    environment:
-      - PYTHONPATH=/app
 
 volumes:
   mongodb_data:

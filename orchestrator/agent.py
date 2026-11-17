@@ -51,17 +51,17 @@ from shared.models import (
     ReplayResult,
     ServiceBaseline,
     SimulationStatus,
-    VerdictResult,
 )
 from shared.demo_mode import (
-    is_demo_mode_active,
-    get_demo_baseline,
-    get_demo_topology,
+    configure_local_wiremock,
+    demo_version_for,
+    get_demo_mr,
     get_demo_requests,
-    get_demo_arize_baseline,
-    get_demo_arize_eval,
+    get_demo_topology,
+    is_demo_mode_active,
     launch_demo_app_subprocess,
-    terminate_demo_app_subprocess,
+    measure_demo_baseline,
+    teardown_demo,
 )
 
 logger = logging.getLogger("bulwark.orchestrator")
@@ -70,6 +70,28 @@ logger = logging.getLogger("bulwark.orchestrator")
 # Per PLAN.md: "If fewer than 50, skip replay scoring and mark
 # 'insufficient real production samples'; do not fabricate probes."
 MIN_REPLAY_REQUESTS: int = 50
+
+# Demo mode shares one local WireMock and measures latency on this machine,
+# so demo simulations run one at a time (a cancelled run releases it early).
+_demo_lock = asyncio.Lock()
+
+
+async def _teardown(simulation_id: str) -> None:
+    """Destroy the ephemeral environment (local subprocesses in demo mode)."""
+    if is_demo_mode_active():
+        await teardown_demo(simulation_id)
+    else:
+        from environment_builder.builder import teardown_environment
+        await teardown_environment(simulation_id)
+
+
+async def _post_comment(message: MREventMessage, body: str) -> None:
+    """Post a status comment on the MR (skipped for dry-run demo scenarios)."""
+    if message.demo_scenario:
+        logger.info("Dry run — comment not posted to GitLab:\n%s", body)
+        return
+    from orchestrator.tools.gitlab_tool import post_mr_comment
+    await post_mr_comment(message.project_id, message.mr_id, body)
 
 
 # ──────────────────────────────────────────────
@@ -87,10 +109,17 @@ async def run_simulation(message: MREventMessage) -> None:
     """
     start_time = time.time()
     try:
-        await asyncio.wait_for(
-            _run_simulation_impl(message),
-            timeout=settings.simulation_timeout_seconds,
-        )
+        if is_demo_mode_active():
+            async with _demo_lock:
+                await asyncio.wait_for(
+                    _run_simulation_impl(message),
+                    timeout=settings.simulation_timeout_seconds,
+                )
+        else:
+            await asyncio.wait_for(
+                _run_simulation_impl(message),
+                timeout=settings.simulation_timeout_seconds,
+            )
     except asyncio.TimeoutError:
         error_log = [
             f"Simulation timed out after {settings.simulation_timeout_seconds} seconds"
@@ -107,11 +136,7 @@ async def run_simulation(message: MREventMessage) -> None:
             status=SimulationStatus.TIMED_OUT,
         )
         try:
-            if is_demo_mode_active():
-                await terminate_demo_app_subprocess(message.simulation_id)
-            else:
-                from environment_builder.builder import teardown_environment
-                await teardown_environment(message.simulation_id)
+            await _teardown(message.simulation_id)
         except Exception as e:
             logger.error("Timed-out simulation teardown failed: %s", e)
 
@@ -178,8 +203,11 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                 logger.info("Simulation %s was cancelled before Step 1 could run — aborting", simulation_id)
                 return
 
-            mr_details = await get_mr_details(message.project_id, message.mr_id)
-            diffs = await get_mr_diff(message.project_id, message.mr_id)
+            if message.demo_scenario:
+                mr_details, diffs = get_demo_mr(message)
+            else:
+                mr_details = await get_mr_details(message.project_id, message.mr_id)
+                diffs = await get_mr_diff(message.project_id, message.mr_id)
             diff_summary = generate_diff_summary(diffs)
 
             # Skip doc-only MRs (FR-005)
@@ -195,6 +223,9 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
             # Identify affected services
             services = identify_services_from_diff(mr_details.changed_files)
             service_name = services[0] if services else "default"
+            if service_name == "default":
+                # Single-service repo: name the service after the project
+                service_name = message.project_id.rsplit("/", 1)[-1] or "default"
 
             # ── Stage 2 AST scan for LLM detection (PRD §10) ──
             # Fetch source files for AST analysis (capped at 50 by llm_detector)
@@ -205,7 +236,7 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
             ][:AST_SCAN_FILE_CAP]
 
             file_contents: dict[str, str] = {}
-            if scannable:
+            if scannable and not message.demo_scenario:
                 try:
                     file_contents = await get_file_contents_batch(
                         message.project_id,
@@ -255,14 +286,32 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
 
         has_incident = False
         arize_baseline: dict = {}
+        baseline_traces: list[dict[str, Any]] = []
 
         if is_demo_mode_active():
-            logger.info("Demo mode: injecting synthetic baselines and request logs")
-            baseline = get_demo_baseline(service_name)
+            logger.info("Demo mode: loading WireMock stubs and measuring the production build")
             topology = get_demo_topology(service_name)
-            production_requests = get_demo_requests(service_name, settings.replay_request_limit)
-            if has_llm_components:
-                arize_baseline = get_demo_arize_baseline(service_name)
+            production_requests = get_demo_requests(settings.replay_request_limit)
+            try:
+                await configure_local_wiremock(topology)
+            except Exception as e:
+                error_log.append(
+                    f"Step 2 (BASELINE) failed: local WireMock at {settings.wiremock_base_url} "
+                    f"is not reachable ({e}). Start it with: docker compose up -d wiremock"
+                )
+                logger.error(error_log[-1])
+                await _fail_simulation(simulation_id, error_log, start_time)
+                return
+            try:
+                baseline, baseline_traces = await measure_demo_baseline(
+                    simulation_id, service_name, production_requests,
+                    fetch_traces=has_llm_components,
+                )
+            except Exception as e:
+                error_log.append(f"Step 2 (BASELINE) failed: {e}")
+                logger.error(error_log[-1])
+                await _fail_simulation(simulation_id, error_log, start_time)
+                return
         else:
             async def _fetch_dynatrace_baseline() -> None:
                 nonlocal baseline, topology, production_requests, has_incident
@@ -316,10 +365,8 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         # Check for active incident (defer evaluation if found)
         if has_incident:
             logger.warning("Active incident detected for %s — deferring", service_name)
-            from orchestrator.tools.gitlab_tool import post_mr_comment
-            await post_mr_comment(
-                message.project_id,
-                message.mr_id,
+            await _post_comment(
+                message,
                 (
                     "## 🛡️ Bulwark — Evaluation Deferred\n\n"
                     f"An active production incident was detected on service `{service_name}`. "
@@ -360,17 +407,8 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
 
         try:
             if is_demo_mode_active():
-                # Determine version:
-                branch = message.source_branch.lower()
-                title = (mr_details.title.lower() if mr_details else "")
-                if "llm" in branch or "llm" in title:
-                    demo_version = "llm-demo"
-                elif "regression" in branch or "n-plus-one" in branch or "regression" in title or "n+1" in title:
-                    demo_version = "regression"
-                else:
-                    demo_version = "fixed"
-                
-                logger.info("Demo mode: launching demo app subprocess in '%s' mode", demo_version)
+                demo_version = demo_version_for(message, mr_details.title if mr_details else "")
+                logger.info("Demo mode: launching demo-app build '%s' as the ephemeral environment", demo_version)
                 environment = await launch_demo_app_subprocess(simulation_id, demo_version)
             else:
                 from environment_builder.builder import provision_environment
@@ -398,12 +436,19 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                     comment_body += "Check the Dockerfile for syntax errors.\n\n"
                 comment_body += f"*Simulation ID: `{simulation_id}`*"
 
-                from orchestrator.tools.gitlab_tool import post_mr_comment
-                await post_mr_comment(message.project_id, message.mr_id, comment_body)
+                await _post_comment(message, comment_body)
+                await update_simulation(simulation_id, {
+                    "environment": environment.model_dump(mode="json"),
+                })
                 await _fail_simulation(
                     simulation_id, error_log, start_time,
-                    status=SimulationStatus.BUILD_FAILED,
+                    # build_failed / build_timeout / health_check_failed / runtime_crash
+                    status=SimulationStatus(environment.status.value),
                 )
+                try:
+                    await _teardown(simulation_id)  # FR-018: tear down on failure too
+                except Exception as e:
+                    logger.error("Teardown after failed provision failed: %s", e)
                 return
 
             await update_simulation(simulation_id, {
@@ -486,27 +531,23 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                 "status": SimulationStatus.EVALUATING.value,
             })
             try:
+                llm_outputs = await _extract_llm_outputs_from_replay(environment)
                 if is_demo_mode_active():
-                    branch = message.source_branch.lower()
-                    title = (mr_details.title.lower() if mr_details else "")
-                    is_regression = ("regression" in branch or "n-plus-one" in branch or "regression" in title or "n+1" in title)
-                    arize_result = get_demo_arize_eval(simulation_id, has_llm_components, is_regression)
+                    # Baseline = traces captured from the production build in Step 2
+                    from orchestrator.tools.arize_tool import evaluate_against_traces
+                    arize_result = await evaluate_against_traces(llm_outputs, baseline_traces)
                 else:
-                    from orchestrator.tools.arize_tool import log_spans, run_eval
-
-                    llm_outputs = await _extract_llm_outputs_from_replay(environment)
+                    from orchestrator.tools.arize_tool import run_eval
 
                     arize_result = await run_eval(
                         simulation_id=simulation_id,
                         simulation_outputs=llm_outputs,
                         baseline_dataset_id=arize_baseline.get("dataset_id"),
+                        baseline_scores=arize_baseline,
                     )
-                    arize_result.llm_detected = True
-
-                    # Log spans (non-blocking)
-                    if llm_outputs:
-                        await log_spans(simulation_id, llm_outputs)
-                        arize_result.arize_span_logged = True
+                arize_result.llm_detected = True
+                if arize_result.skip_reason:
+                    error_log.append(f"Step 6 (LLM EVAL) skipped: {arize_result.skip_reason}")
 
                 logger.info(
                     "Arize eval: hallucination_Δ=%.3f, relevance_Δ=%.3f, groundedness_Δ=%.3f",
@@ -544,11 +585,7 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
         # ════════════════════════════════════════════
         logger.info("── Step 7: TEARDOWN ──")
         try:
-            if is_demo_mode_active():
-                await terminate_demo_app_subprocess(simulation_id)
-            else:
-                from environment_builder.builder import teardown_environment
-                await teardown_environment(simulation_id)
+            await _teardown(simulation_id)
         except Exception as e:
             error_msg = f"Step 7 (TEARDOWN) failed: {e}"
             logger.error(error_msg)
@@ -623,6 +660,7 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
                 replay_result=replay_result,
                 baseline=baseline,
                 arize_result=arize_result,
+                dry_run=bool(message.demo_scenario),
             )
 
         except Exception as e:
@@ -662,11 +700,7 @@ async def _run_simulation_impl(message: MREventMessage) -> None:
 
         # Always attempt teardown even on unexpected errors
         try:
-            if is_demo_mode_active():
-                await terminate_demo_app_subprocess(simulation_id)
-            else:
-                from environment_builder.builder import teardown_environment
-                await teardown_environment(simulation_id)
+            await _teardown(simulation_id)
         except Exception:
             pass
 
@@ -708,11 +742,7 @@ async def _should_abort_cancelled(simulation_id: str, teardown: bool = False) ->
     logger.info("Simulation %s was cancelled — aborting stale workflow", simulation_id)
     if teardown:
         try:
-            if is_demo_mode_active():
-                await terminate_demo_app_subprocess(simulation_id)
-            else:
-                from environment_builder.builder import teardown_environment
-                await teardown_environment(simulation_id)
+            await _teardown(simulation_id)
         except Exception as e:
             logger.error("Cancelled simulation teardown failed: %s", e)
     return True

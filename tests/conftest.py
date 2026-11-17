@@ -23,6 +23,11 @@ Fixture hierarchy
 
 from __future__ import annotations
 
+import os
+
+# Must run before shared.config is imported: tests never read the developer's .env
+os.environ["BULWARK_ENV_FILE"] = os.path.join(os.path.dirname(__file__), "no-such.env")
+
 import asyncio
 import socket
 import threading
@@ -139,10 +144,12 @@ def local_mcp_servers():
     from shared.config import settings
 
     original_gitlab = settings.gitlab_mcp_url
+    original_gitlab_rest = settings.gitlab_url
     original_dynatrace = settings.dynatrace_mcp_url
     original_arize = settings.arize_mcp_url
     original_auth = settings.mcp_auth_token
 
+    settings.gitlab_url = f"http://{host}:{gitlab_port}"  # REST routes of the fake
     settings.gitlab_mcp_url = f"http://{host}:{gitlab_port}/mcp"
     settings.dynatrace_mcp_url = f"http://{host}:{dynatrace_port}/mcp"
     settings.arize_mcp_url = f"http://{host}:{arize_port}/mcp"
@@ -159,6 +166,7 @@ def local_mcp_servers():
 
     # Teardown: restore original settings
     settings.gitlab_mcp_url = original_gitlab
+    settings.gitlab_url = original_gitlab_rest
     settings.dynatrace_mcp_url = original_dynatrace
     settings.arize_mcp_url = original_arize
     settings.mcp_auth_token = original_auth

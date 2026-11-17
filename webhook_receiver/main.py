@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from shared.config import settings
@@ -33,9 +33,10 @@ from shared.db import (
     create_simulation,
     enqueue_message,
     get_database,
+    new_simulation_doc,
     simulation_exists_by_sha,
 )
-from shared.models import MREventMessage, SimulationStatus
+from shared.models import MREventMessage
 
 # ──────────────────────────────────────────────
 # Logging
@@ -127,6 +128,7 @@ async def _handle_override_label(
     db = await get_database()
     simulation = await db["simulations"].find_one(
         {
+            "project_id": project_id,
             "mr_id": mr_id,
             "verdict.verdict": "BLOCKED",
             "gitlab.override_applied": {"$ne": True},
@@ -326,21 +328,8 @@ async def receive_gitlab_webhook(
             override_author=override_author,
         )
 
-    # ── Step 6: Filter — skip documentation-only MRs ──
-    changes = body.get("changes", {})
-    # GitLab sends changed files in the webhook payload under various formats
-    changed_files: list[str] = []
-    if "diff_refs" in object_attrs:
-        # Try to extract from the changes object
-        pass
-    # If we have explicit file changes in the payload
-    if "changes" in body and isinstance(body["changes"], dict):
-        for change_key, change_val in body["changes"].items():
-            if isinstance(change_val, dict) and "previous" in change_val:
-                continue  # These are attribute changes, not file changes
-
-    # We'll do the full doc-only check in the orchestrator using the GitLab API
-    # since webhook payloads may not always include the full file list
+    # ── Step 6: Documentation-only MRs (FR-005) are skipped by the orchestrator,
+    # which has the full file list from the GitLab API (webhook payloads do not).
 
     # ── Step 7: Generate deterministic simulation ID ──
     # Deterministic from mr_id + source_branch + head_sha (ensures idempotency)
@@ -349,7 +338,7 @@ async def receive_gitlab_webhook(
     # ── Step 8: Cancel in-progress simulations for this MR (FR-023) ──
     # If a new push arrives on the same MR, cancel any running simulation
     try:
-        cancelled = await cancel_in_progress_simulation(mr_id, head_sha)
+        cancelled = await cancel_in_progress_simulation(mr_id, head_sha, project_id)
         if cancelled > 0:
             logger.info(
                 "Cancelled %d in-progress simulation(s) for MR %d — new SHA: %s",
@@ -371,30 +360,6 @@ async def receive_gitlab_webhook(
         # If DB is unreachable, proceed anyway (don't block the webhook)
         logger.warning("Idempotency check failed (proceeding): %s", e)
 
-    # ── Step 10: Create initial simulation record ──
-    try:
-        await create_simulation({
-            "_id": simulation_id,
-            "mr_id": mr_id,
-            "project_id": project_id,
-            "head_sha": head_sha,
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "status": SimulationStatus.QUEUED.value,
-            "created_at": datetime.now(timezone.utc),
-            "completed_at": None,
-            "total_duration_ms": 0,
-            "environment": None,
-            "dynatrace": {},
-            "arize": {},
-            "verdict": None,
-            "gitlab": {},
-            "error_log": [],
-        })
-    except Exception as e:
-        logger.warning("Failed to create simulation record (proceeding): %s", e)
-
-    # ── Step 11: Build and enqueue the message ──
     message = MREventMessage(
         simulation_id=simulation_id,
         mr_id=mr_id,
@@ -406,6 +371,13 @@ async def receive_gitlab_webhook(
         received_at=datetime.now(timezone.utc),
     )
 
+    # ── Step 10: Create initial simulation record ──
+    try:
+        await create_simulation(new_simulation_doc(message))
+    except Exception as e:
+        logger.warning("Failed to create simulation record (proceeding): %s", e)
+
+    # ── Step 11: Enqueue the message ──
     try:
         await _publish_to_queue(message)
     except Exception as e:

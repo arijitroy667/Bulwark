@@ -23,7 +23,6 @@ import io
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
 
 import httpx
 
@@ -627,7 +626,7 @@ async def _get_startup_log_tail(service_url: str) -> str:
     The service name is derived from the Cloud Run URL.
     """
     try:
-        from google.cloud import run_v2, logging as gcp_logging
+        from google.cloud import logging as gcp_logging
 
         # Derive service name from URL: https://<service-name>-<hash>-<region>.a.run.app
         # Cloud Run URLs follow this pattern; we extract the service name prefix

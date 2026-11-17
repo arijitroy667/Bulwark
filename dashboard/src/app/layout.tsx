@@ -1,30 +1,27 @@
 import type { Metadata } from 'next';
+import { Inter, JetBrains_Mono } from 'next/font/google';
+import { SiteFooter, SiteHeader } from '@/components/site';
 import './globals.css';
 
+const sans = Inter({ subsets: ['latin'], variable: '--font-sans' });
+const mono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono' });
+
 export const metadata: Metadata = {
-  title: 'Bulwark Dashboard',
-  description: 'Automated MR Evaluation Pipeline',
+  title: {
+    template: '%s · Bulwark',
+    default: 'Bulwark — catch production regressions before they merge',
+  },
+  description:
+    'Bulwark replays real production traffic against every GitLab merge request, evaluates LLM output quality, and gates the merge on one statistically grounded verdict.',
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
       <body>
-        <nav className="navbar">
-          <a href="/" className="nav-brand">
-            <span className="text-gradient">🛡️ Bulwark</span>
-          </a>
-          <div>
-            <a href="/simulations" className="btn btn-primary" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
-              History
-            </a>
-          </div>
-        </nav>
+        <SiteHeader />
         {children}
+        <SiteFooter />
       </body>
     </html>
   );

@@ -174,3 +174,29 @@ def getSLOs(
 ) -> str:
     """Return SLO targets for a service."""
     return json.dumps({"slos": state["slos"]})
+
+
+@mcp.tool(name="execute-dql")
+def execute_dql(dqlQueryString: str) -> str:
+    """Dynatrace MCP `execute-dql`: answers the queries dynatrace_tool sends, from state."""
+    q = dqlQueryString
+    m = state["metrics"]
+    if q.startswith("fetch problems"):
+        rows = state["problems"]
+    elif q.startswith("fetch logs"):
+        rows = state["logs"]
+    elif q.startswith("fetch slos"):
+        rows = state["slos"]
+    elif q.startswith("fetch entities"):
+        rows = [{"fromRelationships.calls": [
+            {"id": d["serviceId"], "type": d["serviceName"]} for d in state["topology"]["dependencies"]
+        ]}]
+    elif "service.response.time" in q:  # Dynatrace reports microseconds
+        rows = [{"p50": m["p50LatencyMs"] * 1000, "p95": m["p95LatencyMs"] * 1000, "p99": m["p99LatencyMs"] * 1000}]
+    elif "service.errors" in q:
+        rows = [{"rate": m["errorRatePercent"]}]
+    elif "requestCount" in q:
+        rows = [{"count": m["throughputRpm"] * 24 * 60}]
+    else:
+        rows = []
+    return json.dumps(rows)

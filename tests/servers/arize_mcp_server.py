@@ -120,6 +120,38 @@ def runEval(
     return json.dumps(state["eval_results"])
 
 
+# ── Official Phoenix MCP tool names (what orchestrator.tools.arize_tool calls) ──
+
+
+@mcp.tool(name="list-datasets")
+def list_datasets(limit: int = 100) -> str:
+    if state["baseline_missing"]:
+        return json.dumps([])
+    return json.dumps([{"id": state["baseline_dataset"]["dataset_id"], "name": "bulwark-prod-demo-app"}])
+
+
+@mcp.tool(name="list-experiments-for-dataset")
+def list_experiments_for_dataset(dataset_id: str, limit: int = 1) -> str:
+    return json.dumps([{"id": "experiment-001"}])
+
+
+@mcp.tool(name="get-experiment-by-id")
+def get_experiment_by_id(experiment_id: str) -> str:
+    b = state["baseline_dataset"]
+    annotations = [
+        {"name": "hallucination", "result": {"score": b["hallucination_score"]}},
+        {"name": "relevance", "result": {"score": b["relevance_score"]}},
+        {"name": "groundedness", "result": {"score": b["groundedness_score"]}},
+    ]
+    return json.dumps({"results": [{"annotations": annotations}] * 3})
+
+
+@mcp.tool(name="add-dataset-examples")
+def add_dataset_examples(dataset_name: str, examples: list[dict[str, Any]]) -> str:
+    state["logged_spans"].extend(examples)
+    return json.dumps({"dataset_name": dataset_name, "added": len(examples)})
+
+
 @mcp.tool()
 def compareDatasets(
     spaceId: str = "",

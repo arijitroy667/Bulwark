@@ -79,6 +79,7 @@ def generate_stubs(topology: ServiceTopology) -> list[WireMockStub]:
                     response_status=200,
                     response_body=default_body,
                     response_headers={"Content-Type": "application/json"},
+                    fixed_delay_ms=dependency.latency_ms,
                 )
                 stubs.append(stub)
 
@@ -127,6 +128,8 @@ def stubs_to_wiremock_json(stubs: list[WireMockStub]) -> list[dict[str, Any]]:
                 "bulwark_dependency": stub.dependency_name,
             },
         }
+        if stub.fixed_delay_ms > 0:
+            mapping["response"]["fixedDelayMilliseconds"] = stub.fixed_delay_ms
         mappings.append(mapping)
 
     return mappings
@@ -149,9 +152,10 @@ def _path_to_pattern(path: str) -> str:
     Convert a URL path to a WireMock URL pattern.
     Replaces path parameters with regex wildcards.
     """
-    # Replace numeric segments with regex
     import re
-    pattern = re.sub(r"/\d+", "/[^/]+", path)
+    # Replace {param} placeholders (illegal in Java regex) and numeric segments
+    pattern = re.sub(r"/\{[^/}]+\}", "/[^/]+", path)
+    pattern = re.sub(r"/\d+", "/[^/]+", pattern)
     # Replace UUID segments with regex
     pattern = re.sub(
         r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",

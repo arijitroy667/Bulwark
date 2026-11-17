@@ -4,31 +4,26 @@
 
 ## What This Does
 
-This service has two versions controlled by the `DEMO_VERSION` environment variable:
+`DEMO_VERSION` selects which "commit" the process runs:
 
-| Version | Behaviour | Expected Bulwark Verdict |
+| Version | Behaviour | Bulwark verdict |
 |---|---|---|
-| `regression` | `GET /users` makes one HTTP call **per user** (N+1 pattern) | 🚫 **BLOCKED** — p95 +187ms |
-| `fixed` (default) | `GET /users` makes a **single batched call** | ✅ **APPROVED** — p95 +3ms |
+| `fixed` (default, = production) | `GET /users` makes **one batched** preferences call | ✅ APPROVED |
+| `regression` | `GET /users` makes **one call per user** (N+1, 25 round trips) | 🚫 BLOCKED |
+| `llm-regression` | ticket-summary prompt edited; answers over-promise | LLM quality drop |
 
-## Demo Scenario (PRD §18)
-
-```
-1. Open MR with DEMO_VERSION=regression → Bulwark posts BLOCKED (43/100)
-2. Fix MR with DEMO_VERSION=fixed      → Bulwark posts APPROVED (91/100)
-```
+Bulwark (demo mode) launches this app itself — once as the production build to measure
+the baseline, once as the MR build — and loads WireMock stubs with a 12 ms delay per
+preferences call. Each `GET /tickets/{id}/summary` records a `{prompt, response, context}`
+trace that Bulwark reads from `GET /traces` for LLM evaluation. The LLM call is a
+deterministic stand-in so runs are reproducible.
 
 ## Local Development
 
 ```bash
 cd demo-app
 pip install -r requirements.txt
-
-# Run the regression version (triggers BLOCKED)
-DEMO_VERSION=regression uvicorn main:app --port 8080
-
-# Run the fixed version (triggers APPROVED)
-DEMO_VERSION=fixed uvicorn main:app --port 8080
+DEMO_VERSION=regression WIREMOCK_BASE_URL=http://127.0.0.1:8082 uvicorn main:app --port 8080
 ```
 
 ## Endpoints
@@ -39,6 +34,8 @@ DEMO_VERSION=fixed uvicorn main:app --port 8080
 | `GET /users` | List users with preferences (regression hotspot) |
 | `GET /users/{id}` | Fetch single user |
 | `GET /metrics` | App metrics |
+| `GET /tickets/{id}/summary` | LLM-backed ticket summary (records a trace) |
+| `GET /traces` | Traces captured since start |
 
 ## WireMock Stubs Expected
 

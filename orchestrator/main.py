@@ -30,14 +30,56 @@ import httpx
 import json
 from sse_starlette.sse import EventSourceResponse
 
-from orchestrator.agent import handle_pubsub_message
+from orchestrator.agent import consume_dev_queue, handle_pubsub_message, run_simulation
 from shared.config import settings
-from shared.db import close_database, get_simulation, save_gitlab_pat, list_simulations
+from shared.db import (
+    cancel_in_progress_simulation,
+    close_database,
+    create_simulation,
+    get_simulation,
+    list_simulations,
+    new_simulation_doc,
+    save_gitlab_pat,
+)
+from shared.demo_mode import DEMO_SCENARIOS, build_demo_message, is_demo_mode_active
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 logger = logging.getLogger("bulwark.orchestrator.worker")
 
 # Track background simulation tasks so we can cancel on shutdown
 _running_tasks: set[asyncio.Task[None]] = set()
+
+# Simulation states after which nothing changes any more
+TERMINAL_STATUSES = {
+    "completed", "cancelled", "error", "timed_out",
+    "build_failed", "build_timeout", "health_check_failed", "runtime_crash",
+}
+
+
+def _track(coro) -> asyncio.Task[None]:
+    """Run a coroutine as a tracked background task (cancelled on shutdown)."""
+    task: asyncio.Task[None] = asyncio.create_task(coro)
+    _running_tasks.add(task)
+
+    def _on_done(completed: asyncio.Task[None]) -> None:
+        _running_tasks.discard(completed)
+        exc = completed.exception() if not completed.cancelled() else None
+        if exc:
+            logger.error("Background task failed: %s", exc)
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+def _public(doc: dict[str, Any]) -> dict[str, Any]:
+    """API view of a simulation: string id, without the 200 per-request results."""
+    doc["_id"] = str(doc["_id"])
+    replay = ((doc.get("dynatrace") or {}).get("replay_result")) or {}
+    replay.pop("individual_results", None)
+    return doc
 
 
 # ──────────────────────────────────────────────
@@ -48,10 +90,14 @@ _running_tasks: set[asyncio.Task[None]] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     logger.info(
-        "Bulwark Orchestrator Worker starting up (v%s, mode=%s)",
+        "Bulwark Orchestrator Worker starting up (v%s, mode=%s, demo=%s)",
         settings.bulwark_version,
         settings.bulwark_mode,
+        is_demo_mode_active(),
     )
+    if settings.bulwark_mode == "development":
+        # No Pub/Sub locally: the webhook receiver queues MR events in MongoDB
+        _track(consume_dev_queue())
     yield
     # Graceful shutdown — cancel any still-running simulations
     if _running_tasks:
@@ -92,6 +138,7 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = settings.bulwark_version
     mode: str = settings.bulwark_mode
+    demo_mode: bool = False
 
 
 class PubSubAckResponse(BaseModel):
@@ -113,7 +160,27 @@ class SetupRequest(BaseModel):
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health_check() -> HealthResponse:
     """Liveness / readiness probe for Cloud Run."""
-    return HealthResponse()
+    return HealthResponse(demo_mode=is_demo_mode_active())
+
+
+class DemoRunRequest(BaseModel):
+    scenario: str
+
+
+@app.post("/api/demo/simulations", tags=["dashboard"])
+async def run_demo_scenario(request: DemoRunRequest):
+    """Start a local demo scenario (dry run: nothing is posted to GitLab)."""
+    if not is_demo_mode_active():
+        raise HTTPException(status_code=400, detail="Demo scenarios need BULWARK_DEMO_MODE=true")
+    if request.scenario not in DEMO_SCENARIOS:
+        raise HTTPException(status_code=422, detail=f"Unknown scenario; use one of {sorted(DEMO_SCENARIOS)}")
+
+    message = build_demo_message(request.scenario)
+    # Same as a new push to the MR: older in-flight runs are cancelled (FR-023)
+    await cancel_in_progress_simulation(message.mr_id, message.head_sha, message.project_id)
+    await create_simulation(new_simulation_doc(message))
+    _track(run_simulation(message))
+    return {"status": "queued", "simulation_id": message.simulation_id, "scenario": request.scenario}
 
 
 @app.post("/api/setup", tags=["dashboard"])
@@ -148,10 +215,7 @@ async def setup_project(request: SetupRequest):
 async def get_simulations(limit: int = 20, skip: int = 0):
     """List recent simulations."""
     docs, total = await list_simulations({}, limit, skip)
-    # Convert ObjectIds to strings
-    for doc in docs:
-        doc["_id"] = str(doc["_id"])
-    return {"data": docs, "total": total}
+    return {"data": [_public(doc) for doc in docs], "total": total}
 
 
 @app.get("/api/simulation/{simulation_id}", tags=["dashboard"])
@@ -160,40 +224,29 @@ async def api_get_simulation(simulation_id: str):
     doc = await get_simulation(simulation_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Simulation not found")
-    doc["_id"] = str(doc["_id"])
-    return doc
+    return _public(doc)
 
 
 @app.get("/api/simulation/{simulation_id}/stream", tags=["dashboard"])
 async def stream_simulation(simulation_id: str, request: Request):
     """Stream simulation state changes using Server-Sent Events."""
     async def event_publisher():
-        last_status = None
-        while True:
-            if await request.is_disconnected():
-                break
-                
+        last_sent = None
+        while not await request.is_disconnected():
             doc = await get_simulation(simulation_id)
             if not doc:
                 yield dict(event="error", data=json.dumps({"error": "not found"}))
                 break
-                
-            # JSON serialization fix
-            doc["_id"] = str(doc["_id"])
-            if "created_at" in doc and hasattr(doc["created_at"], "isoformat"):
-                doc["created_at"] = doc["created_at"].isoformat()
-            if "completed_at" in doc and hasattr(doc["completed_at"], "isoformat"):
-                doc["completed_at"] = doc["completed_at"].isoformat()
-                
-            status = doc.get("status")
-            yield dict(event="message", data=json.dumps(doc))
-            
-            if status in ["completed", "error", "cancelled"]:
+
+            # default=str: datetimes nested anywhere in the record
+            data = json.dumps(_public(doc), default=str)
+            if data != last_sent:
+                yield dict(event="message", data=data)
+                last_sent = data
+            if doc.get("status") in TERMINAL_STATUSES:
                 break
-                
-            last_status = status
             await asyncio.sleep(1)
-            
+
     return EventSourceResponse(event_publisher())
 
 
@@ -251,18 +304,7 @@ async def receive_pubsub_push(request: Request) -> PubSubAckResponse:
     # Dispatch the simulation as a background task and return 200 immediately.
     # Pub/Sub push subscriptions have a 600-second ack deadline; a simulation
     # can take up to 15 minutes. We ack now and let the task run independently.
-    task: asyncio.Task[None] = asyncio.create_task(
-        _run_simulation_background(message_data)
-    )
-    _running_tasks.add(task)
-
-    def _on_done(completed: asyncio.Task[None]) -> None:
-        _running_tasks.discard(completed)
-        exc = completed.exception() if not completed.cancelled() else None
-        if exc:
-            logger.error("Background simulation task failed: %s", exc)
-
-    task.add_done_callback(_on_done)
+    _track(_run_simulation_background(message_data))
     logger.info(
         "Pub/Sub message accepted — simulation dispatched as background task "
         "(%d task(s) now running)",

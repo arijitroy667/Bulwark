@@ -16,7 +16,7 @@ MCP operations implemented (per PRD §6.2) using execute-dql:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 import json
 
@@ -331,6 +331,23 @@ _VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"
 def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
     """
     Parse a Dynatrace log record into a ProductionRequest.
+    Applies PII anonymization before returning.
+
+    Phase 4: Handles four real Dynatrace / OpenTelemetry record shapes:
+
+    1. **Structured direct fields** (e.g., Dynatrace Log v1):
+       ``{"method": "GET", "path": "/api/users", "status": 200}``
+
+    2. **OpenTelemetry span attributes dict** (Dynatrace Distributed Tracing):
+       ``{"attributes": {"http.method": "POST", "http.url": "https://svc/api", "http.status_code": 201}}``
+
+    3. **Dynatrace Logs API v2 log.body wrapper**:
+       ``{"log.body": {"content": "HTTP GET /api/users 200 45ms"}}``
+
+    4. **Free-text content fallback** (Dynatrace Log v1 text):
+       ``{"content": "HTTP GET /api/users/123 200 45ms"}``
+
+    Records with invalid or absent HTTP methods are discarded (returns None).
     """
     import json as _json
     from urllib.parse import urlparse
@@ -340,44 +357,113 @@ def _parse_log_to_request(record: dict[str, Any]) -> ProductionRequest | None:
         path: str = ""
         expected_status: int = 200
 
-        # DQL result columns are often directly mapped to attributes
-        method = str(record.get("http.method", record.get("request.method", record.get("method", "")))).upper()
+        # ── Path 1: OpenTelemetry span attributes dict ──
+        attributes = record.get("attributes")
+        if isinstance(attributes, dict):
+            # Support both canonical OTel (http.method) and Bulwark's (request.method)
+            method = str(
+                attributes.get("http.method")
+                or attributes.get("request.method")
+                or ""
+            ).upper()
+            # Support http.url, http.target, url.path
+            raw_url = (
+                attributes.get("http.url")
+                or attributes.get("http.target")
+                or attributes.get("url.path")
+                or ""
+            )
+            if raw_url:
+                parsed = urlparse(str(raw_url))
+                path = parsed.path or raw_url
+            # Support http.status_code and http.response.status_code
+            expected_status = int(
+                attributes.get("http.status_code")
+                or attributes.get("http.response.status_code")
+                or 200
+            )
+            # Also pull headers/body from OTel attributes
+            raw_headers = attributes.get("http.request.headers", {})
+            headers: dict[str, str] = raw_headers if isinstance(raw_headers, dict) else {}
+            # Also extract individual header attributes: http.request.header.<name>
+            header_prefix = "http.request.header."
+            for attr_key, attr_val in attributes.items():
+                if attr_key.startswith(header_prefix):
+                    header_name = attr_key[len(header_prefix):]
+                    headers[header_name] = str(attr_val)
+            body_raw = attributes.get("http.request.body")
+            if isinstance(body_raw, str):
+                try:
+                    body: Any = _json.loads(body_raw)
+                except _json.JSONDecodeError:
+                    body = body_raw
+            else:
+                body = body_raw
 
-        raw_url = (
-            record.get("http.url")
-            or record.get("url.path")
-            or record.get("path")
-            or record.get("url")
-            or ""
-        )
-        if raw_url:
-            parsed = urlparse(str(raw_url))
-            path = parsed.path if parsed.path else str(raw_url)
         else:
-            path = ""
+            # ── Path 2: Structured direct fields ──
+            method = str(record.get("method") or record.get("http.method", "")).upper()
 
-        expected_status = int(record.get("http.status_code", record.get("status", 200)) or 200)
+            # Path/URL resolution — full URL → extract path component
+            raw_url = (
+                record.get("url")
+                or record.get("http.url")
+                or record.get("url.path")
+                or record.get("path")
+                or ""
+            )
+            if raw_url:
+                parsed = urlparse(str(raw_url))
+                path = parsed.path if parsed.path else str(raw_url)
+            else:
+                path = ""
 
-        # Free-text content fallback
-        if not method or not path:
-            content = str(record.get("content", ""))
+            expected_status = int(record.get("status") or record.get("http.status_code", 200) or 200)
+            raw_headers = record.get("http.request.headers", record.get("headers", {}))
+            headers = raw_headers if isinstance(raw_headers, dict) else {}
+            body_raw = record.get("http.request.body", record.get("body"))
+            if isinstance(body_raw, str):
+                try:
+                    body = _json.loads(body_raw)
+                except _json.JSONDecodeError:
+                    body = body_raw
+            else:
+                body = body_raw
+
+        # ── Path 3: Dynatrace Logs API v2 log.body wrapper ──
+        if (not method or not path) and "log.body" in record:
+            log_body = record["log.body"]
+            content = (
+                log_body.get("content", "") if isinstance(log_body, dict) else str(log_body)
+            )
             method, path, expected_status = _parse_text_content(content, method, path, expected_status)
             headers = {}
             body = None
-        else:
-            headers = {}
-            body = None
 
+        # ── Path 4: Free-text content fallback ──
+        if not method or not path:
+            content = record.get("content", "")
+            method, path, expected_status = _parse_text_content(content, method, path, expected_status)
+            if not isinstance(headers, dict):
+                headers = {}
+            if "body" not in dir():
+                body = None
+
+        # Validate: discard records with absent or invalid HTTP methods
         if not method or method not in _VALID_HTTP_METHODS:
+            logger.debug(
+                "Discarding log record with invalid HTTP method '%s'", method
+            )
             return None
+
         if not path:
             return None
 
         anon_path, anon_headers, anon_body = anonymize_production_request(
             method=method,
             path=path,
-            headers=headers,
-            body=body,
+            headers=headers if isinstance(headers, dict) else {},
+            body=body if isinstance(body, (dict, str)) or body is None else None,
         )
 
         return ProductionRequest(
